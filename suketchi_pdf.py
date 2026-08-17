@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import math
 import os
 import sys
 import textwrap
@@ -14,15 +15,29 @@ try:
 except ImportError:
     import fitz
 
+# Silence MuPDF's noisy stderr messages (e.g. "invalid ICC colorspace",
+# "cmsOpenProfileFromMem failed") that some PDFs trigger via broken embedded
+# ICC color profiles. These are harmless warnings; rendering still succeeds.
+try:
+    fitz.TOOLS.mupdf_display_errors(False)
+except Exception:
+    pass
+try:
+    fitz.TOOLS.mupdf_display_warnings(False)
+except Exception:
+    pass
+
 import random
 
-from PyQt6.QtCore import QObject, QPointF, QRectF, QSize, Qt, QThread, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QBuffer, QIODevice, QObject, QPointF, QRectF, QSize, Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import (
     QAction,
     QActionGroup,
     QColor,
     QFont,
     QFontDatabase,
+    QFontMetrics,
+    QGuiApplication,
     QImage,
     QIcon,
     QPainter,
@@ -131,6 +146,47 @@ APP_FONT_FAMILY = "Segoe UI"
 GREY_MUTED = QColor(120, 120, 120)
 GREY_FAINT = QColor(175, 175, 175)
 
+# Hover fill used by the sketch style / tab bar. Kept as a module-level colour
+# so dark mode can flip it alongside INK / PAPER.
+HOVER = QColor(238, 238, 238)
+
+# Theme palettes. Dark mode simply inverts ink and paper (and picks a hover /
+# grey that reads well on a dark background) so the entire hand-drawn UI flips
+# while keeping its sketch character.
+_THEMES = {
+    "light": {
+        "ink": QColor(0, 0, 0),
+        "paper": QColor(255, 255, 255),
+        "hover": QColor(238, 238, 238),
+        "grey_muted": QColor(120, 120, 120),
+        "grey_faint": QColor(175, 175, 175),
+    },
+    "dark": {
+        "ink": QColor(233, 233, 233),
+        "paper": QColor(24, 24, 26),
+        "hover": QColor(52, 52, 56),
+        "grey_muted": QColor(150, 150, 150),
+        "grey_faint": QColor(110, 110, 110),
+    },
+}
+
+CURRENT_THEME = "light"
+
+
+def apply_theme_colors(name: str):
+    """Mutate the module-level colour objects in place so every painter that
+    already holds a reference to INK / PAPER / etc. picks up the new theme."""
+    global CURRENT_THEME
+    theme = _THEMES.get(name, _THEMES["light"])
+    CURRENT_THEME = name
+    for target, key in (
+        (INK, "ink"), (PAPER, "paper"), (HOVER, "hover"),
+        (GREY_MUTED, "grey_muted"), (GREY_FAINT, "grey_faint"),
+    ):
+        c = theme[key]
+        target.setRgb(c.red(), c.green(), c.blue())
+
+
 
 def sketch_path(rect: QRectF, seed: int, jitter: float = 1.3, segments: int = 5) -> QPainterPath:
     """A wobbly rectangle that looks drawn by hand.
@@ -216,6 +272,44 @@ def draw_sketch_box(
     painter.restore()
 
 
+def render_signature_image(
+    text: str,
+    family: str,
+    color: QColor,
+    point_size: int = 96,
+    scale: int = 3,
+) -> QImage:
+    """Render a typed signature to a transparent, tightly-cropped QImage.
+
+    Retained as a utility (e.g. for previews / exports). Placed signatures are
+    inserted as real embedded text rather than an image, so they stay
+    searchable and movable.
+    """
+    text = (text or "").strip() or " "
+    font = QFont(family)
+    font.setPointSize(point_size * scale)
+    font.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+
+    metrics = QFontMetrics(font)
+    rect = metrics.boundingRect(text)
+    pad = int(point_size * scale * 0.30)
+    w = max(rect.width() + pad * 2, 1)
+    h = max(rect.height() + pad * 2, 1)
+
+    image = QImage(w, h, QImage.Format.Format_ARGB32)
+    image.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+    painter.setFont(font)
+    painter.setPen(QPen(color))
+    # Baseline positioning that accounts for the font's ascent/descent.
+    painter.drawText(pad - rect.left(), pad - rect.top(), text)
+    painter.end()
+    return image
+
+
 class SketchMenu(QMenu):
     """A QMenu that paints its own panel and hand-drawn selection.
 
@@ -224,13 +318,28 @@ class SketchMenu(QMenu):
     style. So instead of styling the item, we paint the panel and the highlight
     box underneath, and let the base implementation draw only the text on top
     (the stylesheet keeps item backgrounds transparent).
+
+    The popup is made a translucent, frameless, shadow-less window so the
+    platform does not draw its own faint rectangular panel / drop shadow behind
+    our hand-drawn box. Only the wobbly sketch box (filled with paper) shows.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.NoDropShadowWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         rect = QRectF(self.rect()).adjusted(1.5, 1.5, -1.5, -1.5)
-        painter.fillRect(self.rect(), PAPER)
+        # Do NOT fill the whole rect: the window is translucent, so anything
+        # outside the sketch box stays fully transparent. The box itself is
+        # filled with paper, which supplies the opaque menu background.
         draw_sketch_box(painter, rect, stable_seed("menu", self.width(), self.height()),
                         fill=PAPER, width=2.0, jitter=1.0)
 
@@ -243,6 +352,144 @@ class SketchMenu(QMenu):
                                 fill=None, width=1.8, jitter=0.9)
         painter.end()
         super().paintEvent(event)
+
+
+class SketchSwatchButton(QPushButton):
+    """A colour-swatch button drawn as a hand-drawn sketch box.
+
+    The Stroke / Fill / Text colour buttons used to be styled with a plain
+    stylesheet border (a flat rectangle), which clashed with the hand-drawn
+    look of the rest of the UI. This button instead paints a wobbly sketch box
+    filled with the current swatch colour, matching every other control.
+    """
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self._swatch = QColor("#ffffff")
+        # No stylesheet border: we paint the box ourselves so the proxy style
+        # is not overridden by QSS box rendering.
+        self.setStyleSheet("background: transparent; border: none;")
+        self.setMinimumHeight(30)
+
+    def set_swatch(self, color: QColor):
+        self._swatch = QColor(color)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        rect = QRectF(self.rect()).adjusted(2.5, 2.5, -3.5, -3.5)
+        seed = stable_seed(id(self), self.width(), self.height())
+
+        state = self.isDown() or self.isChecked()
+        hovered = self.underMouse() and self.isEnabled()
+        offset = 0.0 if state else 3.0
+        target = rect.translated(1.5, 1.5) if state else rect
+
+        draw_sketch_box(
+            painter, target, seed,
+            fill=self._swatch,
+            width=2.0 if self.isEnabled() else 1.2,
+            shadow=self.isEnabled() and not state,
+            shadow_offset=offset,
+            jitter=1.0,
+        )
+
+        # Contrast-aware label colour so text stays readable on any swatch.
+        c = self._swatch
+        luminance = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+        fg = QColor("#1f2733") if luminance > 150 else QColor("#ffffff")
+        painter.setPen(QPen(fg))
+        painter.drawText(target, Qt.AlignmentFlag.AlignCenter, self.text())
+        painter.end()
+
+
+class ThemeToggle(QWidget):
+    """A little hand-drawn sun / moon button that flips light and dark mode.
+
+    Sits in the bottom-right corner. It looks like someone doodled a sun (a
+    circle with wobbly rays) in light mode, and a crescent moon with a couple of
+    stars in dark mode — coherent with the sketch UI.
+    """
+
+    clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._dark = False
+        self._hover = False
+        self.setFixedSize(34, 34)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Toggle dark mode")
+
+    def set_dark(self, dark: bool):
+        self._dark = bool(dark)
+        self.setToolTip("Switch to light mode" if self._dark else "Switch to dark mode")
+        self.update()
+
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.rect()).adjusted(3, 3, -3, -3)
+        seed = stable_seed("themetoggle", self._dark)
+
+        # The enclosing sketch box.
+        draw_sketch_box(painter, r, seed,
+                        fill=HOVER if self._hover else PAPER,
+                        width=1.8, jitter=0.8)
+
+        cx, cy = r.center().x(), r.center().y()
+        painter.setPen(QPen(INK, 1.8, Qt.PenStyle.SolidLine,
+                            Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+
+        if not self._dark:
+            # --- Sun: a wobbly circle with radiating rays. ---
+            rad = 5.0
+            circle = QRectF(cx - rad, cy - rad, rad * 2, rad * 2)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(sketch_path(circle, seed + 1, 0.6))
+            ray_in, ray_out = rad + 1.8, rad + 4.6
+            for k in range(8):
+                ang = math.radians(k * 45 + 10)
+                x1 = cx + math.cos(ang) * ray_in
+                y1 = cy + math.sin(ang) * ray_in
+                x2 = cx + math.cos(ang) * ray_out
+                y2 = cy + math.sin(ang) * ray_out
+                painter.drawPath(sketch_line(QPointF(x1, y1), QPointF(x2, y2),
+                                             seed + 2 + k, 0.35))
+        else:
+            # --- Moon: a crescent made by subtracting an offset circle. ---
+            rad = 6.6
+            outer = QPainterPath()
+            outer.addEllipse(QPointF(cx - 0.5, cy), rad, rad)
+            inner = QPainterPath()
+            inner.addEllipse(QPointF(cx + 3.0, cy - 2.2), rad, rad)
+            crescent = outer.subtracted(inner)
+            painter.setBrush(INK)
+            painter.setPen(QPen(INK, 1.3, Qt.PenStyle.SolidLine,
+                                Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            painter.drawPath(crescent)
+            # A couple of little sketch stars.
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for sx, sy, s in ((cx + 6.5, cy - 6.5, 1.7), (cx + 8, cy + 3, 1.3)):
+                painter.drawPath(sketch_line(QPointF(sx - s, sy), QPointF(sx + s, sy),
+                                             seed + 20 + int(sx), 0.3))
+                painter.drawPath(sketch_line(QPointF(sx, sy - s), QPointF(sx, sy + s),
+                                             seed + 30 + int(sy), 0.3))
+        painter.end()
 
 
 class SketchStyle(QProxyStyle):
@@ -276,7 +523,7 @@ class SketchStyle(QProxyStyle):
             if on or sunken:
                 fill = INK
             elif hovered and enabled:
-                fill = QColor(238, 238, 238)
+                fill = HOVER
             else:
                 fill = PAPER
 
@@ -308,12 +555,15 @@ class SketchStyle(QProxyStyle):
             QStyle.PrimitiveElement.PE_PanelMenu,
             QStyle.PrimitiveElement.PE_FrameMenu,
         ):
-            painter.save()
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            painter.fillRect(option.rect, PAPER)
-            painter.restore()
+            # SketchMenu is a translucent popup that paints its own wobbly,
+            # paper-filled box in paintEvent. Painting an opaque rectangle here
+            # would show up as a faint rectangle behind that box, so for our
+            # menus we skip the panel entirely. Any other (non-sketch) menu
+            # still gets a hand-drawn outline.
+            if isinstance(widget, SketchMenu):
+                return
             draw_sketch_box(painter, QRectF(option.rect).adjusted(1.5, 1.5, -1.5, -1.5),
-                            seed, fill=None, width=2.0, jitter=1.0)
+                            seed, fill=PAPER, width=2.0, jitter=1.0)
             return
 
         if element == QStyle.PrimitiveElement.PE_IndicatorCheckBox:
@@ -400,7 +650,7 @@ class SketchStyle(QProxyStyle):
                 if on or sunken:
                     fill = INK
                 elif hovered and enabled:
-                    fill = QColor(238, 238, 238)
+                    fill = HOVER
                 else:
                     fill = PAPER
                 target = rect.translated(1.5, 1.5) if (on or sunken) else rect
@@ -447,6 +697,7 @@ class Tool:
     CROP = "Crop Page"
     LINK = "Insert Hyperlink"
     IMAGE = "Insert Image"
+    SIGN = "Add Signature"
 
 
 DRAG_RECT_TOOLS = {
@@ -465,6 +716,7 @@ CLICK_TOOLS = {
     Tool.EDIT_BLOCK,
     Tool.NOTE,
     Tool.IMAGE,
+    Tool.SIGN,
 }
 
 LINE_TOOLS = {Tool.LINE}
@@ -594,6 +846,153 @@ class MetadataEditDialog(QDialog):
 
     def metadata(self) -> Dict[str, str]:
         return {k: v.text() for k, v in self.fields.items()}
+
+
+class SignaturePreview(QWidget):
+    """Shows the typed signature inside a hand-drawn box, coherent with the UI."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._text = ""
+        self._family = APP_FONT_FAMILY
+        self._color = QColor("#111111")
+        self._size = 48
+        self.setMinimumHeight(120)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_signature(self, text: str, family: str, color: QColor, size: int = 48):
+        self._text = text
+        self._family = family
+        self._color = QColor(color)
+        self._size = max(8, int(size))
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = QRectF(self.rect()).adjusted(3, 3, -3, -3)
+        draw_sketch_box(painter, r, stable_seed("sigpreview", int(r.width())),
+                        fill=PAPER, width=1.8, jitter=0.8)
+
+        text = (self._text or "").strip()
+        if not text:
+            painter.setPen(QPen(GREY_FAINT))
+            painter.setFont(QFont(APP_FONT_FAMILY, 12))
+            painter.drawText(r, Qt.AlignmentFlag.AlignCenter,
+                             "Type your name to preview your signature")
+            painter.end()
+            return
+
+        # Draw at the chosen point size, but scale down if it would overflow
+        # the preview box so the whole signature always stays visible.
+        inner = r.adjusted(16, 12, -16, -12)
+        size = self._size
+        font = QFont(self._family)
+        font.setPointSize(size)
+        metrics = QFontMetrics(font)
+        tw = metrics.horizontalAdvance(text)
+        th = metrics.height()
+        if tw > 0 and th > 0:
+            factor = min(inner.width() / tw, inner.height() / th, 1.0)
+            size = max(8, int(size * factor))
+            font.setPointSize(size)
+        painter.setFont(font)
+        painter.setPen(QPen(self._color))
+        painter.drawText(inner, Qt.AlignmentFlag.AlignCenter, text)
+        painter.end()
+
+
+class SignatureDialog(QDialog):
+    """Create a typed signature from a prebuilt script font, with a live,
+    sketch-styled preview and a colour choice."""
+
+    def __init__(self, parent: QWidget, default_name: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Add Signature")
+        self.resize(560, 460)
+
+        self._color = QColor("#111111")
+        self._families = load_signature_fonts()
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        form = QFormLayout()
+        self.name_input = QLineEdit()
+        self.name_input.setText(default_name)
+        self.name_input.setPlaceholderText("Type your full name…")
+        self.name_input.textChanged.connect(self._refresh)
+        form.addRow("Name:", self.name_input)
+        layout.addLayout(form)
+
+        layout.addWidget(QLabel("Signature style:"))
+        self.style_list = QListWidget()
+        self.style_list.setIconSize(QSize(0, 0))
+        self.style_list.setMaximumHeight(150)
+        for family in self._families:
+            item = QListWidgetItem(family)
+            item.setData(Qt.ItemDataRole.UserRole, family)
+            f = QFont(family)
+            f.setPointSize(22)
+            item.setFont(f)
+            self.style_list.addItem(item)
+        self.style_list.setCurrentRow(0)
+        self.style_list.currentRowChanged.connect(lambda _i: self._refresh())
+        layout.addWidget(self.style_list)
+
+        # Size + colour row.
+        options_row = QHBoxLayout()
+        options_row.addWidget(QLabel("Font size:"))
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(12, 120)
+        self.size_spin.setValue(48)
+        self.size_spin.setSuffix(" pt")
+        self.size_spin.valueChanged.connect(lambda _v: self._refresh())
+        options_row.addWidget(self.size_spin)
+        options_row.addSpacing(16)
+        options_row.addWidget(QLabel("Ink colour:"))
+        self.color_button = SketchSwatchButton("Colour")
+        self.color_button.set_swatch(self._color)
+        self.color_button.clicked.connect(self._choose_color)
+        options_row.addWidget(self.color_button)
+        options_row.addStretch()
+        layout.addLayout(options_row)
+
+        self.preview = SignaturePreview()
+        layout.addWidget(self.preview)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        self._ok_button = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._refresh()
+
+    def _choose_color(self):
+        color = QColorDialog.getColor(self._color, self, "Signature Colour")
+        if color.isValid():
+            self._color = color
+            self.color_button.set_swatch(color)
+            self._refresh()
+
+    def _refresh(self):
+        family = self.current_family()
+        text = self.name_input.text()
+        self.preview.set_signature(text, family, self._color, self.size_spin.value())
+        if self._ok_button is not None:
+            self._ok_button.setEnabled(bool(text.strip()))
+
+    def current_family(self) -> str:
+        item = self.style_list.currentItem()
+        if item is not None:
+            return item.data(Qt.ItemDataRole.UserRole)
+        return self._families[0] if self._families else APP_FONT_FAMILY
+
+    def result_values(self) -> Tuple[str, str, QColor, int]:
+        return (self.name_input.text().strip(), self.current_family(),
+                QColor(self._color), int(self.size_spin.value()))
 
 
 class PasswordDialog(QDialog):
@@ -1111,6 +1510,198 @@ class ImageExportWorker(QObject):
             self.finished.emit(self.job_id)
 
 
+class DocumentTab:
+    """All per-document state for one open PDF, so multiple PDFs can live in
+    tabs at once (Adobe-Acrobat style). Editor-wide preferences such as the
+    active tool, colours and line width are intentionally NOT stored here — they
+    stay shared across tabs, matching how Acrobat behaves."""
+
+    def __init__(self, doc, file_path, password=""):
+        self.doc = doc
+        self.file_path = file_path
+        self.password = password
+        self.current_page_index = 0
+        self.zoom = 1.25
+        self.is_dirty = False
+        self.search_results: List[Tuple[int, "fitz.Rect"]] = []
+        self.search_index = -1
+        self.undo_stack: List[bytes] = []
+        self.redo_stack: List[bytes] = []
+        self.doc_version = 0
+        self.render_cache: Dict[Tuple[int, float, int], QPixmap] = {}
+        self.render_cache_order: List[Tuple[int, float, int]] = []
+        self.xray_cache: Dict[Tuple[int, int, int], Dict[str, List[QRectF]]] = {}
+        self.page_structure_changed = False
+        # A freshly opened document defaults to Fit Page the first time it is
+        # shown; afterwards the user's chosen zoom is preserved across switches.
+        self.needs_fit_width = True
+        # Signature placements for THIS document, tracked with their clean
+        # source data so they can be re-drawn (moved) without reading text back
+        # from the PDF, whose subset script-font encoding can be unreadable.
+        self.signatures: List[Dict] = []
+
+    def title(self) -> str:
+        return Path(self.file_path).name if self.file_path else "Untitled"
+
+
+class SketchTabBar(QWidget):
+    """A hand-drawn document tab strip, coherent with the sketch UI.
+
+    Each tab is painted as a wobbly sketch box (filled when active) with the
+    document name and a small close cross. Signals let the window switch or
+    close documents.
+    """
+
+    tab_selected = pyqtSignal(int)
+    tab_closed = pyqtSignal(int)
+    new_tab_requested = pyqtSignal()
+
+    _TAB_H = 30
+    _MIN_TAB_W = 120
+    _MAX_TAB_W = 220
+    _GAP = 8
+    _PAD = 6
+    _PLUS_W = 34
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._tabs: List[str] = []
+        self._active = -1
+        self._hover = -1
+        self._hover_close = -1
+        self._hover_plus = False
+        self.setMouseTracking(True)
+        self.setFixedHeight(self._TAB_H + 12)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_tabs(self, titles: List[str], active: int):
+        self._tabs = list(titles)
+        self._active = active
+        self.setVisible(len(self._tabs) > 0)
+        self.update()
+
+    # -- geometry helpers ---------------------------------------------------
+    def _tab_width(self) -> int:
+        if not self._tabs:
+            return self._MIN_TAB_W
+        avail = self.width() - self._PAD * 2 - self._PLUS_W - self._GAP
+        per = (avail - self._GAP * (len(self._tabs) - 1)) / max(1, len(self._tabs))
+        return int(max(self._MIN_TAB_W, min(self._MAX_TAB_W, per)))
+
+    def _tab_rect(self, index: int) -> QRectF:
+        w = self._tab_width()
+        x = self._PAD + index * (w + self._GAP)
+        return QRectF(x, 6, w, self._TAB_H)
+
+    def _plus_rect(self) -> QRectF:
+        w = self._tab_width()
+        x = self._PAD + len(self._tabs) * (w + self._GAP)
+        return QRectF(x, 6, self._PLUS_W, self._TAB_H)
+
+    def _close_rect(self, tab_rect: QRectF) -> QRectF:
+        s = 16
+        return QRectF(tab_rect.right() - s - 6,
+                      tab_rect.center().y() - s / 2, s, s)
+
+    # -- events -------------------------------------------------------------
+    def mouseMoveEvent(self, event):
+        pos = event.position()
+        self._hover = -1
+        self._hover_close = -1
+        self._hover_plus = self._plus_rect().contains(pos)
+        for i in range(len(self._tabs)):
+            r = self._tab_rect(i)
+            if r.contains(pos):
+                self._hover = i
+                if self._close_rect(r).contains(pos):
+                    self._hover_close = i
+                break
+        self.update()
+
+    def leaveEvent(self, event):
+        self._hover = self._hover_close = -1
+        self._hover_plus = False
+        self.update()
+
+    def mousePressEvent(self, event):
+        pos = event.position()
+        if self._plus_rect().contains(pos):
+            self.new_tab_requested.emit()
+            return
+        for i in range(len(self._tabs)):
+            r = self._tab_rect(i)
+            if r.contains(pos):
+                if self._close_rect(r).contains(pos):
+                    self.tab_closed.emit(i)
+                elif i != self._active:
+                    self.tab_selected.emit(i)
+                return
+        # Middle-click closes a tab, like most tabbed apps.
+        if event.button() == Qt.MouseButton.MiddleButton:
+            for i in range(len(self._tabs)):
+                if self._tab_rect(i).contains(pos):
+                    self.tab_closed.emit(i)
+                    return
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), PAPER)
+
+        fm = painter.fontMetrics()
+        for i, title in enumerate(self._tabs):
+            r = self._tab_rect(i)
+            active = (i == self._active)
+            hovered = (i == self._hover)
+            seed = stable_seed("doctab", i, int(r.width()))
+            fill = HOVER if (hovered and not active) else PAPER
+            draw_sketch_box(
+                painter, r.adjusted(1.5, 1.5, -1.5, -1.5), seed,
+                fill=fill, width=2.0 if active else 1.5,
+                shadow=active, shadow_offset=2.5, jitter=0.9,
+            )
+
+            close_r = self._close_rect(r)
+            text_area = r.adjusted(10, 0, -(close_r.width() + 12), 0)
+            elided = fm.elidedText(title, Qt.TextElideMode.ElideRight,
+                                   int(text_area.width()))
+            painter.setPen(QPen(INK if active else GREY_MUTED))
+            painter.drawText(text_area, Qt.AlignmentFlag.AlignVCenter |
+                             Qt.AlignmentFlag.AlignLeft, elided)
+
+            # Close cross (drawn as two little sketchy strokes).
+            cc = close_r.center()
+            if self._hover_close == i:
+                draw_sketch_box(painter, close_r.adjusted(1, 1, -1, -1),
+                                seed + 7, fill=HOVER,
+                                width=1.2, jitter=0.7)
+            painter.setPen(QPen(INK, 1.6, Qt.PenStyle.SolidLine,
+                                Qt.PenCapStyle.RoundCap))
+            d = 4.0
+            painter.drawPath(sketch_line(QPointF(cc.x() - d, cc.y() - d),
+                                         QPointF(cc.x() + d, cc.y() + d),
+                                         seed + 3, 0.5))
+            painter.drawPath(sketch_line(QPointF(cc.x() + d, cc.y() - d),
+                                         QPointF(cc.x() - d, cc.y() + d),
+                                         seed + 4, 0.5))
+
+        # The "new tab" (+) button.
+        pr = self._plus_rect()
+        draw_sketch_box(painter, pr.adjusted(1.5, 1.5, -1.5, -1.5),
+                        stable_seed("doctab_plus", int(pr.width())),
+                        fill=HOVER if self._hover_plus else PAPER,
+                        width=1.5, jitter=0.8)
+        pc = pr.center()
+        painter.setPen(QPen(INK, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawPath(sketch_line(QPointF(pc.x() - 6, pc.y()),
+                                     QPointF(pc.x() + 6, pc.y()),
+                                     stable_seed("plush"), 0.5))
+        painter.drawPath(sketch_line(QPointF(pc.x(), pc.y() - 6),
+                                     QPointF(pc.x(), pc.y() + 6),
+                                     stable_seed("plusv"), 0.5))
+        painter.end()
+
+
 class PdfStudioOverhaulPro(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1130,6 +1721,8 @@ class PdfStudioOverhaulPro(QMainWindow):
         self.search_results: List[Tuple[int, fitz.Rect]] = []
         self.search_index = -1
         self.pending_image_path: Optional[str] = None
+        self.pending_signature: Optional[Dict] = None
+        self.signatures: List[Dict] = []
         self.undo_stack: List[bytes] = []
         self.redo_stack: List[bytes] = []
         self.max_history = 10
@@ -1146,8 +1739,14 @@ class PdfStudioOverhaulPro(QMainWindow):
         self.xray_enabled = False
         self._xray_cache: Dict[Tuple[int, int, int], Dict[str, List[QRectF]]] = {}
 
+        # Open documents, one per tab (Acrobat-style). self.doc etc. always
+        # mirror the active tab so all existing logic keeps working unchanged.
+        self.tabs: List[DocumentTab] = []
+        self.active_tab_index = -1
+        self._switching_tab = False
+
         self.setWindowTitle("Suketchi PDF Reader")
-        self.resize(1540, 950)
+        self._apply_adaptive_geometry()
 
         self.setAcceptDrops(True)
 
@@ -1155,6 +1754,38 @@ class PdfStudioOverhaulPro(QMainWindow):
         self._apply_theme()
         self._update_contextual_panel()
         self._set_document_controls(False)
+
+    def _apply_adaptive_geometry(self):
+        """Size and center the window relative to the available screen area so
+        the app fits any display size / resolution."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            self.resize(1540, 950)
+            return
+
+        available = screen.availableGeometry()
+        # Prefer ~85% of the available area, but never exceed the screen and
+        # never shrink below a usable minimum.
+        width = max(960, min(int(available.width() * 0.85), available.width()))
+        height = max(600, min(int(available.height() * 0.85), available.height()))
+
+        # A sensible minimum so widgets never get clipped on tiny displays.
+        self.setMinimumSize(
+            min(960, available.width()),
+            min(600, available.height()),
+        )
+
+        self.resize(width, height)
+
+        # Center within the available geometry.
+        frame = self.frameGeometry()
+        frame.moveCenter(available.center())
+        self.move(frame.topLeft())
+
+    def _reposition_theme_toggle(self):
+        # The theme toggle now lives in the ribbon toolbar, so no manual
+        # positioning is needed.
+        pass
 
     def _build_ui(self):
         self.status = QStatusBar()
@@ -1206,9 +1837,34 @@ class PdfStudioOverhaulPro(QMainWindow):
         body.setStretchFactor(0, 1)
         body.setStretchFactor(1, 7)
         body.setStretchFactor(2, 1)
-        body.setSizes([260, 980, 255])
 
-        self.setCentralWidget(body)
+        # Distribute the splitter proportionally to the current window width so
+        # the layout adapts to any display size. The side panels are clamped to
+        # their own min/max widths; the center canvas takes the remaining space.
+        total = max(self.width(), 960)
+        side = max(238, min(int(total * 0.17), 320))
+        props = max(210, min(int(total * 0.15), 250))
+        center = max(total - side - props, 400)
+        body.setSizes([side, center, props])
+
+        # Wrap the splitter so the window has breathing room on the left/right
+        # (and top/bottom), coherent with the padded look of the rest of the UI
+        # instead of the content sitting flush against the window edges.
+        self.tab_bar = SketchTabBar()
+        self.tab_bar.tab_selected.connect(self.switch_to_tab)
+        self.tab_bar.tab_closed.connect(self.close_tab)
+        self.tab_bar.new_tab_requested.connect(self.open_pdf)
+        self.tab_bar.setVisible(False)
+
+        container = QWidget()
+        container.setObjectName("BodyContainer")
+        outer = QVBoxLayout(container)
+        outer.setContentsMargins(14, 6, 14, 12)
+        outer.setSpacing(4)
+        outer.addWidget(self.tab_bar)
+        outer.addWidget(body, 1)
+
+        self.setCentralWidget(container)
 
     def _build_top_bar(self):
         top = QToolBar("Ribbon")
@@ -1216,6 +1872,9 @@ class PdfStudioOverhaulPro(QMainWindow):
         top.setObjectName("Ribbon")
         top.setIconSize(QSize(16, 16))
         top.setContentsMargins(6, 4, 6, 4)
+        # Disable the default right-click context menu on the ribbon (it would
+        # otherwise offer to hide the toolbar, making "the menu go away").
+        top.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, top)
 
         brand_pixmap = load_seal_pixmap(24)
@@ -1258,7 +1917,8 @@ class PdfStudioOverhaulPro(QMainWindow):
         top.addWidget(self.edit_menu_button)
 
         self.insert_menu_button = self._menu_button("Insert", [
-            ("Image or Signature…", self.prepare_insert_image),
+            ("Image…", self.prepare_insert_image),
+            ("Signature…", self.prepare_signature),
             ("Watermark…", self.add_watermark),
             ("Stamp…", self.add_stamp),
             None,
@@ -1330,6 +1990,14 @@ class PdfStudioOverhaulPro(QMainWindow):
         self.zoom_combo.currentTextChanged.connect(self.handle_zoom_combo)
         top.addWidget(self.zoom_combo)
         self.zoom_in_action = self._add_action(top, "+", self.zoom_in, "Ctrl++")
+
+        # Hand-drawn sun / moon dark-mode toggle, sitting right after the zoom
+        # "+" button so it lives with the other trailing ribbon controls and
+        # respects the toolbar's margins / spacing.
+        self.theme_toggle = ThemeToggle()
+        self.theme_toggle.clicked.connect(self.toggle_theme)
+        self.theme_toggle.set_dark(CURRENT_THEME == "dark")
+        top.addWidget(self.theme_toggle)
 
     def _menu_button(self, label: str, items) -> QToolButton:
         """Build a ribbon dropdown.
@@ -1419,6 +2087,7 @@ class PdfStudioOverhaulPro(QMainWindow):
         Tool.REDACT: "Redact",
         Tool.CROP: "Crop",
         Tool.LINK: "Link",
+        Tool.SIGN: "Signature",
     }
 
     TOOL_FIELDS = {
@@ -1438,6 +2107,7 @@ class PdfStudioOverhaulPro(QMainWindow):
         Tool.LINK: set(),
         Tool.SELECT: set(),
         Tool.IMAGE: set(),
+        Tool.SIGN: set(),
     }
 
     TOOL_HINTS = {
@@ -1445,7 +2115,7 @@ class PdfStudioOverhaulPro(QMainWindow):
         Tool.TEXT_BOX: "Drag a box, then type the text to draw inside it.",
         Tool.EDIT_TEXT: "Click a word to replace it. Its original size and colour are reused.",
         Tool.EDIT_BLOCK: "Click a paragraph to replace the whole block.",
-        Tool.MOVE_TEXT: "Drag existing text to a new position on the page.",
+        Tool.MOVE_TEXT: "Drag a signature or text box you added to a new position.",
         Tool.NOTE: "Click to drop a sticky note comment.",
         Tool.HIGHLIGHT: "Drag across text to highlight it.",
         Tool.UNDERLINE: "Drag across text to underline it.",
@@ -1457,6 +2127,7 @@ class PdfStudioOverhaulPro(QMainWindow):
         Tool.CROP: "Drag the area to keep, then confirm the crop.",
         Tool.LINK: "Drag an area, then enter the URL it should open.",
         Tool.IMAGE: "Click where the chosen image should be placed.",
+        Tool.SIGN: "Click where your signature should be placed.",
     }
 
     def _update_contextual_panel(self):
@@ -1549,13 +2220,13 @@ class PdfStudioOverhaulPro(QMainWindow):
         self.opacity_spin.setValue(35)
         self.opacity_spin.valueChanged.connect(lambda value: setattr(self, "opacity_percent", value))
 
-        self.text_color_button = QPushButton("Text")
+        self.text_color_button = SketchSwatchButton("Text")
         self.text_color_button.clicked.connect(lambda: self.choose_color("text"))
 
-        self.stroke_color_button = QPushButton("Stroke")
+        self.stroke_color_button = SketchSwatchButton("Stroke")
         self.stroke_color_button.clicked.connect(lambda: self.choose_color("stroke"))
 
-        self.fill_color_button = QPushButton("Fill")
+        self.fill_color_button = SketchSwatchButton("Fill")
         self.fill_color_button.clicked.connect(lambda: self.choose_color("fill"))
 
         style_form.addRow("Font size:", self.font_size_spin)
@@ -1572,170 +2243,203 @@ class PdfStudioOverhaulPro(QMainWindow):
         return panel
 
     def _apply_theme(self):
-        self.setStyleSheet("""
+        t = _THEMES.get(CURRENT_THEME, _THEMES["light"])
+        paper = t["paper"].name()
+        ink = t["ink"].name()
+        muted = t["grey_muted"].name()
+        faint = t["grey_faint"].name()
+        # Text drawn on top of an INK-filled control (checked buttons, etc.)
+        # must be the paper colour to stay readable in both themes.
+        on = paper
+        disabled = faint
+        # A slightly lifted handle-hover derived from ink.
+        hh = t["hover"].lighter(160).name() if CURRENT_THEME == "dark" else "#4a4a4a"
+        sep = t["grey_faint"].name()
+        self.setStyleSheet(f"""
             /* ============================================================
-               Suketchi PDF Reader — hand-drawn, pure black on white
-               Only ink (#000), paper (#fff) and two greys for text that would
-               otherwise be unreadable. Weight stays regular throughout.
+               Suketchi PDF Reader — hand-drawn. Ink / paper flip between the
+               light and dark themes; the sketch character stays the same.
                ============================================================ */
 
-            QMainWindow, QWidget {
-                background: #ffffff;
-                color: #000000;
+            QMainWindow, QWidget {{
+                background: {paper};
+                color: {ink};
                 font-size: 14px;
                 font-weight: 400;
-            }
+            }}
 
-            QToolBar#Ribbon {
-                background: #ffffff;
+            QToolBar#Ribbon {{
+                background: {paper};
                 border: none;
                 padding: 10px 14px;
                 spacing: 6px;
-            }
-            QToolBar#Ribbon::separator { background: transparent; width: 10px; }
+            }}
+            QToolBar#Ribbon::separator {{ background: transparent; width: 10px; }}
 
             /* Buttons: colour + spacing only. Outline comes from SketchStyle. */
-            QToolButton, QPushButton {
-                color: #000000;
+            QToolButton, QPushButton {{
+                color: {ink};
                 padding: 7px 14px;
                 min-height: 20px;
-            }
-            QToolButton:disabled, QPushButton:disabled { color: #afafaf; }
-            QToolButton:checked, QPushButton:checked { color: #ffffff; }
-            QToolButton::menu-indicator { image: none; width: 0px; }
+            }}
+            QToolButton:disabled, QPushButton:disabled {{ color: {disabled}; }}
+            QToolButton:checked, QPushButton:checked {{ color: {on}; }}
+            QToolButton::menu-indicator {{ image: none; width: 0px; }}
 
-            QToolButton#Primary, QPushButton#Primary { padding: 7px 18px; }
-            QToolButton#ToolButton { padding: 7px 8px; }
+            QToolButton#Primary, QPushButton#Primary {{ padding: 7px 18px; }}
+            QToolButton#ToolButton {{ padding: 7px 8px; }}
 
             /* QComboBox is deliberately absent: any rule here would hand the
                widget to Qt's stylesheet engine and lose the hand-drawn box. */
-            QSpinBox, QLineEdit {
-                color: #000000;
+            QSpinBox, QLineEdit {{
+                color: {ink};
                 padding: 6px 14px;
                 min-height: 20px;
-                selection-background-color: #000000;
-                selection-color: #ffffff;
-            }
-            QLineEdit::placeholder { color: #a0a0a0; }
-            QSpinBox::up-button, QSpinBox::down-button { border: none; background: transparent; width: 0px; }
+                selection-background-color: {ink};
+                selection-color: {paper};
+            }}
+            QLineEdit::placeholder {{ color: {muted}; }}
+            QSpinBox::up-button, QSpinBox::down-button {{ border: none; background: transparent; width: 0px; }}
 
-            QComboBox QAbstractItemView {
-                background: #ffffff;
-                color: #000000;
-                border: 2px solid #000000;
+            QComboBox QAbstractItemView {{
+                background: {paper};
+                color: {ink};
+                border: 2px solid {ink};
                 padding: 4px;
                 outline: 0;
-            }
+            }}
 
             /* SketchMenu paints the panel and the selection box itself, so
                item backgrounds stay transparent and text stays ink-coloured
                even when the row is active. */
-            QMenu { background: transparent; border: none; padding: 7px; }
-            QMenu::item {
+            QMenu {{ background: transparent; border: none; padding: 7px; }}
+            QMenu::item {{
                 background: transparent;
-                color: #000000;
+                color: {ink};
                 padding: 8px 30px 8px 16px;
                 margin: 1px 2px;
-            }
-            QMenu::item:selected { background: transparent; color: #000000; }
-            QMenu::item:disabled { color: #b4b4b4; }
-            QMenu::separator { height: 1px; background: #c8c8c8; margin: 6px 12px; }
+            }}
+            QMenu::item:selected {{ background: transparent; color: {ink}; }}
+            QMenu::item:disabled {{ color: {disabled}; }}
+            QMenu::separator {{ height: 1px; background: {sep}; margin: 6px 12px; }}
 
-            QTabWidget#SidebarTabs { background: #ffffff; }
-            QTabWidget::pane { background: #ffffff; border: none; }
-            QTabBar::tab {
+            QTabWidget#SidebarTabs {{ background: {paper}; }}
+            QTabWidget::pane {{ background: {paper}; border: none; }}
+            QTabBar::tab {{
                 background: transparent;
-                color: #787878;
+                color: {muted};
                 border: none;
                 padding: 8px 7px;
                 margin-right: 2px;
-            }
-            QTabBar::tab:selected { color: #000000; }
-            QTabBar::tab:hover:!selected { color: #303030; }
+            }}
+            QTabBar::tab:selected {{ color: {ink}; }}
+            QTabBar::tab:hover:!selected {{ color: {ink}; }}
 
-            QListWidget { background: #ffffff; color: #000000; border: none; outline: 0; }
+            QListWidget {{ background: {paper}; color: {ink}; border: none; outline: 0; }}
             /* Spacing only — the selection box itself is drawn by SketchStyle. */
-            QListWidget::item { padding: 7px 8px; margin: 3px 6px; }
+            QListWidget::item {{ padding: 7px 8px; margin: 3px 6px; }}
 
-            QTextEdit {
-                background: #ffffff;
-                color: #000000;
-                border: 2px solid #000000;
+            QTextEdit {{
+                background: {paper};
+                color: {ink};
+                border: 2px solid {ink};
                 padding: 7px;
-                selection-background-color: #000000;
-                selection-color: #ffffff;
-            }
+                selection-background-color: {ink};
+                selection-color: {paper};
+            }}
 
-            QGroupBox {
+            QGroupBox {{
                 background: transparent;
                 border: none;
                 margin-top: 15px;
                 padding: 10px 8px 8px 8px;
-                color: #000000;
-            }
-            QGroupBox::title {
+                color: {ink};
+            }}
+            QGroupBox::title {{
                 subcontrol-origin: margin;
                 left: 10px;
                 padding: 0 6px;
-                color: #000000;
+                color: {ink};
                 font-size: 13px;
-            }
+            }}
 
-            QLabel#PanelTitle {
+            QLabel#PanelTitle {{
                 font-size: 20px;
                 font-weight: 400;
-                color: #000000;
+                color: {ink};
                 padding: 2px 2px 4px 2px;
-            }
-            QLabel#ToolHint { color: #787878; font-size: 13px; padding: 0 3px 6px 3px; }
-            QLabel#BrandText { color: #000000; font-size: 19px; padding: 0 6px 0 0; }
-            QLabel#SmallNote { color: #787878; font-size: 13px; }
+            }}
+            QLabel#ToolHint {{ color: {muted}; font-size: 13px; padding: 0 3px 6px 3px; }}
+            QLabel#BrandText {{ color: {ink}; font-size: 19px; padding: 0 6px 0 0; }}
+            QLabel#SmallNote {{ color: {muted}; font-size: 13px; }}
 
-            QWidget#PropertiesPanel { background: #ffffff; }
+            QWidget#PropertiesPanel {{ background: {paper}; }}
 
-            QSplitter::handle { background: #ffffff; }
-            QSplitter::handle:horizontal { width: 2px; background: #000000; }
+            QSplitter::handle {{ background: {paper}; }}
+            QSplitter::handle:horizontal {{ width: 2px; background: {ink}; }}
 
-            QScrollArea { background: #ffffff; border: none; }
-            QScrollBar:vertical, QScrollBar:horizontal {
+            QScrollArea {{ background: {paper}; border: none; }}
+            QScrollBar:vertical, QScrollBar:horizontal {{
                 background: transparent; border: none; margin: 2px;
                 width: 12px; height: 12px;
-            }
-            QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
-                background: #000000; border-radius: 6px; min-height: 34px; min-width: 34px;
-            }
-            QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover { background: #4a4a4a; }
+            }}
+            QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
+                background: {ink}; border-radius: 6px; min-height: 34px; min-width: 34px;
+            }}
+            QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {{ background: {hh}; }}
             QScrollBar::add-line, QScrollBar::sub-line,
-            QScrollBar::add-page, QScrollBar::sub-page {
+            QScrollBar::add-page, QScrollBar::sub-page {{
                 width: 0px; height: 0px; background: none;
-            }
+            }}
 
-            QStatusBar { background: #ffffff; color: #787878; border: none; font-size: 13px; }
-            QStatusBar::item { border: none; }
+            QStatusBar {{ background: {paper}; color: {muted}; border: none; font-size: 13px; }}
+            QStatusBar::item {{ border: none; }}
 
-            QProgressBar {
-                background: #ffffff; color: #000000;
-                border: 2px solid #000000; text-align: center;
+            QProgressBar {{
+                background: {paper}; color: {ink};
+                border: 2px solid {ink}; text-align: center;
                 font-size: 12px; min-height: 16px;
-            }
-            QProgressBar::chunk { background: #000000; }
+            }}
+            QProgressBar::chunk {{ background: {ink}; }}
 
-            QDialog { background: #ffffff; color: #000000; }
-            QDialogButtonBox QPushButton { min-width: 88px; padding: 8px 18px; }
+            QDialog {{ background: {paper}; color: {ink}; }}
+            QDialogButtonBox QPushButton {{ min-width: 88px; padding: 8px 18px; }}
 
-            QCheckBox { color: #000000; spacing: 8px; }
-            QCheckBox::indicator { width: 18px; height: 18px; background: transparent; border: none; }
+            QCheckBox {{ color: {ink}; spacing: 8px; }}
+            QCheckBox::indicator {{ width: 18px; height: 18px; background: transparent; border: none; }}
 
-            QFormLayout QLabel { color: #000000; font-size: 13px; }
+            QFormLayout QLabel {{ color: {ink}; font-size: 13px; }}
 
-            QMessageBox { background: #ffffff; color: #000000; }
-            QMessageBox QPushButton { min-width: 80px; }
+            QMessageBox {{ background: {paper}; color: {ink}; }}
+            QMessageBox QPushButton {{ min-width: 80px; }}
 
-            QToolTip {
-                background: #ffffff; color: #000000;
-                border: 2px solid #000000; padding: 6px 9px;
-            }
+            QToolTip {{
+                background: {paper}; color: {ink};
+                border: 2px solid {ink}; padding: 6px 9px;
+            }}
         """)
+
+    def toggle_theme(self):
+        self.set_theme("light" if CURRENT_THEME == "dark" else "dark")
+
+    def set_theme(self, name: str):
+        """Flip the whole hand-drawn UI between light and dark by inverting the
+        shared ink / paper colours, then re-applying the stylesheet, palette and
+        repainting every widget."""
+        apply_theme_colors(name)
+        app = QApplication.instance()
+        if app is not None:
+            _apply_bw_palette(app)
+        self._apply_theme()
+        if getattr(self, "theme_toggle", None) is not None:
+            self.theme_toggle.set_dark(name == "dark")
+        # Repaint everything: custom-painted widgets hold INK / PAPER refs that
+        # now point at the new colours.
+        self.canvas.update()
+        self.tab_bar.update()
+        self.update()
+        for w in self.findChildren(QWidget):
+            w.update()
 
     def _set_document_controls(self, enabled: bool):
         widgets = [
@@ -1769,16 +2473,22 @@ class PdfStudioOverhaulPro(QMainWindow):
         self._refresh_history_actions()
 
     def open_pdf(self):
-        if self.is_dirty and not self._confirm_discard():
-            return
-
+        # Opening a document now adds a tab rather than replacing the current
+        # one, so no discard confirmation is needed here.
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF Files (*.pdf)")
         if not path:
             return
         self.load_pdf(path)
 
     def load_pdf(self, path: str):
-        """Open a PDF from a known path (file dialog, drag-and-drop, CLI)."""
+        """Open a PDF from a known path (file dialog, drag-and-drop, CLI) in a
+        new tab. If the file is already open, just switch to its tab."""
+        # Already open? Focus that tab instead of opening a duplicate.
+        for i, tab in enumerate(self.tabs):
+            if tab.file_path and os.path.abspath(tab.file_path) == os.path.abspath(path):
+                self.switch_to_tab(i)
+                return
+
         try:
             doc = fitz.open(path)
             opened_password = ""
@@ -1797,35 +2507,149 @@ class PdfStudioOverhaulPro(QMainWindow):
             if doc.page_count == 0:
                 raise ValueError("The selected PDF has no pages.")
 
-            if self.doc:
-                self.doc.close()
+            # Snapshot the currently active tab before switching context.
+            self._snapshot_active_tab()
 
-            self.doc = doc
-            self.file_path = path
-            self._pdf_password = opened_password
-            self.current_page_index = 0
-            self.zoom = 1.25
-            self.is_dirty = False
-            self.undo_stack.clear()
-            self.redo_stack.clear()
-            self.search_results.clear()
-            self.search_results_list.clear()
-            self._doc_version = 0
-            if not hasattr(self, "_render_cache"):
-                self._render_cache = {}
-            if not hasattr(self, "_render_cache_order"):
-                self._render_cache_order = []
-            self._render_cache.clear()
-            self._render_cache_order.clear()
-
-            self._set_document_controls(True)
-            self.refresh_sidebars()
-            self.render_current_page()
-            self._update_window_title()
+            tab = DocumentTab(doc, path, opened_password)
+            self.tabs.append(tab)
+            self.active_tab_index = len(self.tabs) - 1
+            self._restore_active_tab()
+            self._refresh_tab_bar()
             self.status.showMessage(f"Opened {path}")
 
         except Exception as exc:
             QMessageBox.critical(self, "Open Error", f"Could not open PDF:\n{exc}")
+
+    # ---- Tab management ---------------------------------------------------
+    def _snapshot_active_tab(self):
+        """Copy the window's live per-document fields back into the active tab."""
+        if not (0 <= self.active_tab_index < len(self.tabs)):
+            return
+        tab = self.tabs[self.active_tab_index]
+        tab.doc = self.doc
+        tab.file_path = self.file_path
+        tab.password = self._pdf_password
+        tab.current_page_index = self.current_page_index
+        tab.zoom = self.zoom
+        tab.is_dirty = self.is_dirty
+        tab.search_results = list(self.search_results)
+        tab.search_index = self.search_index
+        tab.undo_stack = list(self.undo_stack)
+        tab.redo_stack = list(self.redo_stack)
+        tab.doc_version = self._doc_version
+        tab.render_cache = self._render_cache
+        tab.render_cache_order = self._render_cache_order
+        tab.xray_cache = self._xray_cache
+        tab.page_structure_changed = self._page_structure_changed
+        tab.signatures = self.signatures
+
+    def _restore_active_tab(self):
+        """Load the active tab's state into the window's live fields and paint."""
+        if not (0 <= self.active_tab_index < len(self.tabs)):
+            self._clear_to_empty_state()
+            return
+        tab = self.tabs[self.active_tab_index]
+        self.doc = tab.doc
+        self.file_path = tab.file_path
+        self._pdf_password = tab.password
+        self.current_page_index = tab.current_page_index
+        self.zoom = tab.zoom
+        self.is_dirty = tab.is_dirty
+        self.search_results = tab.search_results
+        self.search_index = tab.search_index
+        self.undo_stack = tab.undo_stack
+        self.redo_stack = tab.redo_stack
+        self._doc_version = tab.doc_version
+        self._render_cache = tab.render_cache
+        self._render_cache_order = tab.render_cache_order
+        self._xray_cache = tab.xray_cache
+        self._page_structure_changed = tab.page_structure_changed
+        self.signatures = getattr(tab, "signatures", [])
+
+        self.search_results_list.clear()
+        self._set_document_controls(True)
+        self.refresh_sidebars()
+        if tab.needs_fit_width:
+            # First time this document is shown: default to Fit Page.
+            tab.needs_fit_width = False
+            self.zoom = tab.zoom
+            self.fit_page()
+        else:
+            self.render_current_page()
+        self._update_window_title()
+
+    def _clear_to_empty_state(self):
+        """No documents open: reset to the initial blank/no-doc state."""
+        self.doc = None
+        self.file_path = None
+        self._pdf_password = ""
+        self.current_page_index = 0
+        self.zoom = 1.25
+        self.is_dirty = False
+        self.search_results = []
+        self.search_index = -1
+        self.undo_stack = []
+        self.redo_stack = []
+        self._doc_version = 0
+        self._render_cache = {}
+        self._render_cache_order = []
+        self._xray_cache = {}
+        self._page_structure_changed = False
+        self.signatures = []
+        self.search_results_list.clear()
+        self.page_list.clear()
+        self.outline_list.clear()
+        self.comments_list.clear()
+        self.canvas.set_page(QPixmap(), self.zoom)
+        self._set_document_controls(False)
+        self._update_window_title()
+
+    def switch_to_tab(self, index: int):
+        if index == self.active_tab_index or not (0 <= index < len(self.tabs)):
+            return
+        self._snapshot_active_tab()
+        self.active_tab_index = index
+        self._restore_active_tab()
+        self._refresh_tab_bar()
+
+    def close_tab(self, index: int):
+        if not (0 <= index < len(self.tabs)):
+            return
+        # Make the target tab active so dirty checks apply to it.
+        if index != self.active_tab_index:
+            self.switch_to_tab(index)
+        if self.is_dirty and not self._confirm_discard():
+            return
+
+        tab = self.tabs.pop(index)
+        try:
+            if tab.doc is not None:
+                tab.doc.close()
+        except Exception:
+            pass
+
+        if not self.tabs:
+            self.active_tab_index = -1
+            self._clear_to_empty_state()
+            self._refresh_tab_bar()
+            return
+
+        # Pick a sensible neighbouring tab.
+        self.active_tab_index = min(index, len(self.tabs) - 1)
+        self._restore_active_tab()
+        self._refresh_tab_bar()
+
+    def _refresh_tab_bar(self):
+        titles = [t.title() + (" •" if t.is_dirty else "") for t in self.tabs]
+        # For the active tab, read the live window fields so a rename ("Save
+        # As") or an unsaved-edit marker shows immediately, before any snapshot.
+        if 0 <= self.active_tab_index < len(titles):
+            base = Path(self.file_path).name if self.file_path else "Untitled"
+            titles[self.active_tab_index] = base + (" •" if self.is_dirty else "")
+        self.tab_bar.set_tabs(titles, self.active_tab_index)
+        self.tab_bar.setVisible(len(self.tabs) > 0)
+
+
 
     def save_as_pdf(self):
         if self.doc is None:
@@ -2041,12 +2865,19 @@ class PdfStudioOverhaulPro(QMainWindow):
             ]
 
             edit_rects: List[QRectF] = []
-            if self.current_tool in {Tool.EDIT_TEXT, Tool.MOVE_TEXT}:
+            if self.current_tool == Tool.EDIT_TEXT:
                 for span in self._iter_text_spans(page):
                     edit_rects.append(self._pdf_rect_to_image_rect(span.bbox))
             elif self.current_tool == Tool.EDIT_BLOCK:
                 for block in self._iter_text_blocks(page):
                     edit_rects.append(self._pdf_rect_to_image_rect(block.bbox))
+            if self.current_tool == Tool.MOVE_TEXT:
+                # The Move tool only moves items you added; outline just those
+                # (signatures and text boxes) on this page so they are easy to
+                # grab, and nothing else.
+                for sig in self.signatures:
+                    if sig.get("page") == self.current_page_index:
+                        edit_rects.append(self._pdf_rect_to_image_rect(fitz.Rect(sig["rect"])))
 
             crop_preview = None
             if page.cropbox != page.mediabox:
@@ -2185,6 +3016,12 @@ class PdfStudioOverhaulPro(QMainWindow):
 
     def set_tool(self, tool: str):
         self.current_tool = tool
+        # Drop any pending placement payloads if the user leaves that tool, so a
+        # stale signature/image is not dropped by a later click.
+        if tool != Tool.SIGN:
+            self.pending_signature = None
+        if tool != Tool.IMAGE:
+            self.pending_image_path = None
         self.canvas.set_tool(tool)
         for name, button in self.tool_buttons.items():
             button.blockSignals(True)
@@ -2207,20 +3044,10 @@ class PdfStudioOverhaulPro(QMainWindow):
             self.fill_color = color
         self._refresh_color_buttons()
 
-    @staticmethod
-    def _swatch_style(color: QColor) -> str:
-        """Swatch button style with a readable, contrast-aware label color."""
-        luminance = 0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()
-        fg = "#1f2733" if luminance > 150 else "#ffffff"
-        return (
-            f"background:{color.name()}; color:{fg};"
-            "border:2px solid #000000; padding:6px 12px; font-weight:400;"
-        )
-
     def _refresh_color_buttons(self):
-        self.text_color_button.setStyleSheet(self._swatch_style(self.text_color))
-        self.stroke_color_button.setStyleSheet(self._swatch_style(self.annotation_color))
-        self.fill_color_button.setStyleSheet(self._swatch_style(self.fill_color))
+        self.text_color_button.set_swatch(self.text_color)
+        self.stroke_color_button.set_swatch(self.annotation_color)
+        self.fill_color_button.set_swatch(self.fill_color)
 
     def handle_canvas_action(self, tool: str, payload):
         if tool == "__open_pdf__":
@@ -2273,6 +3100,8 @@ class PdfStudioOverhaulPro(QMainWindow):
                 self.add_url_link(payload)
             elif tool == Tool.IMAGE:
                 self.insert_image_at(payload)
+            elif tool == Tool.SIGN:
+                self.place_signature_at(payload)
             return True
         except Exception as exc:
             QMessageBox.critical(self, "Tool Error", f"{tool} failed:\n{exc}")
@@ -2290,38 +3119,117 @@ class PdfStudioOverhaulPro(QMainWindow):
         self.scroll.verticalScrollBar().setValue(self.scroll.verticalScrollBar().value() - int(delta.y()))
 
     def begin_move_text(self, image_point: QPointF) -> bool:
-        page = self.doc[self.current_page_index]
         pdf_point = fitz.Point(image_point.x() / self.zoom, image_point.y() / self.zoom)
-        hit = self._find_span_at_point(page, pdf_point)
-        if not hit:
+        self._moving_image_hit = None
+        self._moving_signature_index = None
+
+        # The Move tool only repositions items YOU added (signatures and text
+        # boxes), which are tracked with clean source data. Existing PDF body
+        # text is left alone, because re-inserting arbitrary embedded/subset
+        # fonts corrupts the text on repeated moves.
+        sig_index = self._find_signature_at_point(self.current_page_index, pdf_point)
+        if sig_index is not None:
             self._moving_text_hit = None
-            self.status.showMessage("Move Text: click directly on selectable text.")
-            return False
-        self._moving_text_hit = hit
-        self.status.showMessage(f"Move Text: dragging '{hit.text[:40]}'")
-        return True
+            self._moving_signature_index = sig_index
+            kind = self.signatures[sig_index].get("kind", "signature")
+            self.status.showMessage("Move: dragging %s" % ("text box" if kind == "textbox" else "signature"))
+            return True
+
+        self._moving_text_hit = None
+        self.status.showMessage("Move: click a signature or text box you added.")
+        return False
+
+    def _find_image_at_point(self, page, point: fitz.Point) -> Optional[Dict]:
+        """Return info for the top-most image whose placement contains the
+        click, so signatures and inserted images can be moved. Later-drawn
+        images sit on top, so we scan in reverse draw order."""
+        try:
+            infos = page.get_image_info(xrefs=True)
+        except Exception:
+            infos = []
+        tol = fitz.Rect(point.x - 2, point.y - 2, point.x + 2, point.y + 2)
+        chosen = None
+        chosen_bbox = None
+        for info in infos:  # draw order; keep the last (top-most) match
+            bbox = fitz.Rect(info["bbox"])
+            if bbox.is_empty or bbox.is_infinite:
+                continue
+            if bbox.contains(point) or bbox.intersects(tol):
+                chosen = info
+                chosen_bbox = bbox
+        if chosen is None:
+            return None
+        xref = int(chosen.get("xref", 0))
+        if xref <= 0:
+            return None
+        # Build a Pixmap from the xref so any transparency (SMask) is preserved;
+        # extract_image alone loses the alpha and would re-insert as an opaque
+        # (black) rectangle.
+        try:
+            pix = fitz.Pixmap(self.doc, xref)
+            if pix.width <= 0 or pix.height <= 0:
+                return None
+            png_bytes = pix.tobytes("png")
+            width, height = pix.width, pix.height
+        except Exception:
+            try:
+                extracted = self.doc.extract_image(xref)
+                png_bytes = extracted.get("image")
+                width = int(extracted.get("width", 0) or 0)
+                height = int(extracted.get("height", 0) or 0)
+            except Exception:
+                return None
+        if not png_bytes or width <= 0 or height <= 0:
+            return None
+        return {"bbox": chosen_bbox, "bytes": png_bytes, "w": width,
+                "h": height, "xref": xref}
 
     def end_move_text(self, image_points: Tuple[QPointF, QPointF]):
-        if not self._moving_text_hit:
-            return
         start, end = image_points
+        if self.zoom <= 0:
+            return
         dx = (end.x() - start.x()) / self.zoom
         dy = (end.y() - start.y()) / self.zoom
-        if abs(dx) < 0.5 and abs(dy) < 0.5:
-            self._moving_text_hit = None
+
+        # --- Moving a tracked item (signature or added text box) ---
+        # These are always redrawn from clean source data, so their text, font,
+        # size and colour are preserved no matter how many times they move.
+        sig_index = getattr(self, "_moving_signature_index", None)
+        if sig_index is not None:
+            self._moving_signature_index = None
+            if abs(dx) < 0.5 and abs(dy) < 0.5:
+                return
+            if not (0 <= sig_index < len(self.signatures)):
+                return
+            sig = self.signatures[sig_index]
+            page = self.doc[self.current_page_index]
+            old_rect = fitz.Rect(sig["rect"])
+            size = float(sig.get("size", 48))
+            # The stored rect already covers the drawn glyphs generously; a
+            # small extra margin guarantees the script-font tails are cleared.
+            erase = old_rect + (-2, -2, size * 0.3, 2)
+            self._push_undo()
+            page.add_redact_annot(erase, fill=(1, 1, 1))
+            page.apply_redactions()
+            self.signatures.pop(sig_index)
+            col = sig.get("color", [17, 17, 17])
+            color = QColor(col[0], col[1], col[2])
+            # old_rect.x0/y0 include the padding applied at draw time; recover
+            # the original insertion point so the move offset stays accurate.
+            self._draw_signature(
+                page, self.current_page_index,
+                old_rect.x0 + dx + size * 0.1, old_rect.y0 + dy + size * 0.2,
+                sig["name"], sig.get("fontfile"), size, color,
+                kind=sig.get("kind", "signature"), align=sig.get("align", 0),
+            )
+            label = "Text box moved" if sig.get("kind") == "textbox" else "Signature moved"
+            self._mark_dirty(label, refresh_sidebars=True)
             return
 
-        page = self.doc[self.current_page_index]
-        hit = self._moving_text_hit
+        # Nothing tracked was under the cursor: do nothing (existing PDF body
+        # text and images are intentionally not movable to avoid corruption).
         self._moving_text_hit = None
-        old_rect = hit.bbox + (-1, -1, 1, 1)
-        new_rect = fitz.Rect(hit.bbox.x0 + dx, hit.bbox.y0 + dy, hit.bbox.x1 + dx, hit.bbox.y1 + dy) + (-1, -1, 8, 4)
-
-        self._push_undo()
-        page.add_redact_annot(old_rect, fill=(1, 1, 1))
-        page.apply_redactions()
-        self._safe_insert_textbox(page, new_rect, hit.text, max(6, hit.size), hit.color, align=0)
-        self._mark_dirty("Text moved")
+        self._moving_image_hit = None
 
     def edit_existing_text_span(self, image_point: QPointF):
         page = self.doc[self.current_page_index]
@@ -2544,12 +3452,15 @@ class PdfStudioOverhaulPro(QMainWindow):
 
         return fitz.Rect(x0, y0, x1, y1)
 
-    def _safe_insert_textbox(self, page, rect: fitz.Rect, text: str, fontsize: float, color: QColor, align: int = 0):
+    def _safe_insert_textbox(self, page, rect: fitz.Rect, text: str, fontsize: float, color: QColor, align: int = 0, fontfile: Optional[str] = None):
         """Insert text safely and never treat negative insert_textbox return as success.
 
         insert_textbox does not always raise an exception. When text does not
         fit, it returns a negative number and draws nothing. That was the cause
         of the disappearing text bug.
+
+        If ``fontfile`` is given (e.g. a signature's original script font), it is
+        embedded and tried first so the moved text keeps its typeface.
         """
         if not text or not str(text).strip():
             return 0
@@ -2560,8 +3471,19 @@ class PdfStudioOverhaulPro(QMainWindow):
         draw_rect = self._expanded_text_rect(page, fitz.Rect(rect), text_value, font_size)
         last_error = None
 
+        # Build the list of fonts to attempt. A custom fontfile (if valid) goes
+        # first, then the built-in Helvetica fallbacks. A fresh unique alias per
+        # call forces PyMuPDF to (re-)embed the font, which is important after a
+        # redaction may have dropped a previous embedding.
+        embedded_alias = None
+        if fontfile and Path(fontfile).exists():
+            self._font_alias_counter = getattr(self, "_font_alias_counter", 0) + 1
+            embedded_alias = "sig%d" % self._font_alias_counter
+        font_attempts = ([(embedded_alias, fontfile)] if embedded_alias else []) + \
+                        [("helv", None), ("Helvetica", None), (None, None)]
+
         for candidate_rect in (draw_rect, fitz.Rect(rect)):
-            for fontname in ("helv", "Helvetica", None):
+            for fontname, ffile in font_attempts:
                 try:
                     kwargs = dict(
                         fontsize=font_size,
@@ -2571,6 +3493,8 @@ class PdfStudioOverhaulPro(QMainWindow):
                     )
                     if fontname:
                         kwargs["fontname"] = fontname
+                    if ffile:
+                        kwargs["fontfile"] = ffile
                     rc = page.insert_textbox(candidate_rect, text_value, **kwargs)
                     if rc is None or rc >= 0:
                         return rc
@@ -2730,16 +3654,14 @@ class PdfStudioOverhaulPro(QMainWindow):
         self._push_undo()
         page = self.doc[self.current_page_index]
         rect = self._image_rect_to_pdf_rect(image_rect)
-        page.insert_textbox(
-            rect,
-            text,
-            fontsize=self.font_size_spin.value(),
-            fontname="helv",
-            color=rgb_from_qcolor(self.text_color),
-            align=0,
-            overlay=True,
+        # Register the text box like a signature so it can be moved cleanly with
+        # the Move tool (re-drawn from its original text/size/colour).
+        self._draw_signature(
+            page, self.current_page_index,
+            rect.x0, rect.y0, text, None,
+            float(self.font_size_spin.value()), self.text_color,
+            kind="textbox", align=0,
         )
-        page.draw_rect(rect, color=rgb_from_qcolor(self.annotation_color), width=0.6, overlay=True)
         self._mark_dirty("Text box added", refresh_sidebars=True)
 
     def add_note(self, image_point: QPointF):
@@ -2921,6 +3843,124 @@ class PdfStudioOverhaulPro(QMainWindow):
         self.pending_image_path = None
         self.set_tool(Tool.SELECT)
         self._mark_dirty("Image inserted", refresh_sidebars=True)
+
+    def prepare_signature(self):
+        if self.doc is None:
+            return
+        default = ""
+        try:
+            info = self.doc.metadata or {}
+            default = info.get("author", "") or ""
+        except Exception:
+            default = ""
+        dialog = SignatureDialog(self, default_name=default)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, family, color, size = dialog.result_values()
+        if not name:
+            return
+        # Signatures are inserted as real (searchable, movable) text drawn with
+        # the chosen script font, so they behave like any other text: they can
+        # be repositioned with the Move tool and never turn into opaque boxes.
+        self.pending_signature = {
+            "name": name,
+            "family": family,
+            "color": QColor(color),
+            "size": int(size),
+            "fontfile": signature_font_file(family),
+        }
+        self.set_tool(Tool.SIGN)
+        self.status.showMessage("Click where you want to place your signature.")
+
+    def place_signature_at(self, image_point: QPointF):
+        if not self.pending_signature:
+            return
+        sig = self.pending_signature
+        name = sig.get("name", "")
+        if not name:
+            return
+
+        self._push_undo()
+        page = self.doc[self.current_page_index]
+        x, y = self._image_point_to_pdf_xy(image_point)
+        self._draw_signature(
+            page, self.current_page_index, x, y, name,
+            sig.get("fontfile"), float(sig.get("size", 48)),
+            sig.get("color", QColor("#111111")),
+        )
+
+        self.pending_signature = None
+        self.set_tool(Tool.SELECT)
+        self._mark_dirty("Signature added", refresh_sidebars=True)
+
+    def _draw_signature(self, page, page_index, x, y, name, fontfile, size, color, kind="signature", align=0):
+        """Draw text (a signature or an added text box) as embedded text and
+        record it in the per-document registry, so it can later be moved from
+        clean source data rather than re-reading possibly-garbled subset text
+        from the PDF."""
+        size = float(size)
+        self._font_alias_counter = getattr(self, "_font_alias_counter", 0) + 1
+        fontname = "sig%d" % self._font_alias_counter
+
+        # Multi-line support (text boxes may contain newlines).
+        lines = name.splitlines() or [name]
+        try:
+            if fontfile:
+                text_len = max(fitz.get_text_length(ln, fontfile=fontfile, fontname=fontname, fontsize=size) for ln in lines)
+            else:
+                text_len = max(fitz.get_text_length(ln, fontname="helv", fontsize=size) for ln in lines)
+        except Exception:
+            text_len = max(len(ln) for ln in lines) * size * 0.5
+        n_lines = len(lines)
+        box_w = min(max(text_len + size, size * 2), page.rect.width * 0.95)
+        box_h = size * (1.4 * n_lines + 0.4)
+        rect = fitz.Rect(x, y, x + box_w, y + box_h)
+
+        kwargs = dict(fontsize=size, color=rgb_from_qcolor(color), align=align, overlay=True)
+        if fontfile:
+            kwargs["fontname"] = fontname
+            kwargs["fontfile"] = fontfile
+        else:
+            kwargs["fontname"] = "helv"
+
+        rc = page.insert_textbox(rect, name, **kwargs)
+        if rc < 0:
+            rect = fitz.Rect(x, y, x + page.rect.width * 0.95, y + box_h * 1.5)
+            page.insert_textbox(rect, name, **kwargs)
+
+        # Record the placement with a rect generous enough to (a) match a later
+        # click and (b) fully cover the drawn glyphs — including script-font
+        # tails and descenders — when the item is erased for a move.
+        pad_x = size * 0.4
+        placed_rect = fitz.Rect(
+            x - pad_x * 0.25,
+            y - size * 0.2,
+            x + min(text_len + pad_x, box_w) + pad_x,
+            y + size * (1.4 * n_lines + 0.3),
+        )
+        self.signatures.append({
+            "page": int(page_index),
+            "rect": [placed_rect.x0, placed_rect.y0, placed_rect.x1, placed_rect.y1],
+            "name": name,
+            "fontfile": fontfile,
+            "size": size,
+            "color": [color.red(), color.green(), color.blue()],
+            "kind": kind,
+            "align": align,
+        })
+
+    def _find_signature_at_point(self, page_index: int, point: fitz.Point) -> Optional[int]:
+        """Return the index in self.signatures of a placed signature under the
+        point on the given page, or None."""
+        tol = fitz.Rect(point.x - 3, point.y - 3, point.x + 3, point.y + 3)
+        best = None
+        for i, sig in enumerate(self.signatures):
+            if sig.get("page") != page_index:
+                continue
+            r = fitz.Rect(sig["rect"])
+            if r.contains(point) or r.intersects(tol):
+                best = i  # later placements are on top
+        return best
 
     def add_stamp(self):
         presets = ["DRAFT", "APPROVED", "CONFIDENTIAL", "REVIEWED", "PAID", "VOID", "FINAL"]
@@ -3450,6 +4490,9 @@ class PdfStudioOverhaulPro(QMainWindow):
         name = Path(self.file_path).name if self.file_path else "Untitled"
         mark = " •" if self.is_dirty else ""
         self.setWindowTitle(f"Suketchi — {name}{mark}")
+        # Keep the active tab's dirty marker in sync with the title.
+        if getattr(self, "tab_bar", None) is not None and self.tabs:
+            self._refresh_tab_bar()
 
     def _confirm_discard(self) -> bool:
         response = QMessageBox.question(
@@ -3500,14 +4543,21 @@ class PdfStudioOverhaulPro(QMainWindow):
             event.ignore()
             return
         event.acceptProposedAction()
-        if self.is_dirty and not self._confirm_discard():
-            return
+        # Dropping a PDF opens it in a new tab; nothing is discarded.
         self.load_pdf(path)
 
+    def createPopupMenu(self):
+        # Suppress QMainWindow's default toolbar/dock context menu so a right
+        # click on the ribbon (e.g. the X-ray button) can never hide it.
+        return None
+
     def closeEvent(self, event):
-        if self.is_dirty and not self._confirm_discard():
-            event.ignore()
-            return
+        # Confirm once if ANY open tab has unsaved changes.
+        self._snapshot_active_tab()
+        if any(t.is_dirty for t in self.tabs) or self.is_dirty:
+            if not self._confirm_discard():
+                event.ignore()
+                return
         for thread, worker in list(self._workers):
             try:
                 worker.cancelled = True
@@ -3516,22 +4566,35 @@ class PdfStudioOverhaulPro(QMainWindow):
             thread.quit()
             thread.wait(2000)
         self._workers.clear()
+        for tab in self.tabs:
+            try:
+                if tab.doc is not None:
+                    tab.doc.close()
+            except Exception:
+                pass
+        self.tabs.clear()
         if self.doc:
-            self.doc.close()
+            try:
+                self.doc.close()
+            except Exception:
+                pass
         event.accept()
 
 
 def load_hand_font() -> str:
     """Load the bundled handwriting font, else fall back gracefully.
 
-    Looks for PatrickHand-Regular.ttf next to this script (or in ./assets).
-    If it is missing, tries handwriting faces that ship with common systems,
-    and finally settles for a normal sans so the app still runs everywhere.
+    Looks for PatrickHand-Regular.ttf in ./fonts (or ./assets, or next to the
+    script). If it is missing, tries handwriting faces that ship with common
+    systems, and finally settles for a normal sans so the app still runs
+    everywhere.
     """
     global APP_FONT_FAMILY
 
     here = Path(__file__).resolve().parent
     for candidate in (
+        here / "fonts" / "PatrickHand-Regular.ttf",
+        here / "assets" / "fonts" / "PatrickHand-Regular.ttf",
         here / "PatrickHand-Regular.ttf",
         here / "assets" / "PatrickHand-Regular.ttf",
     ):
@@ -3551,6 +4614,90 @@ def load_hand_font() -> str:
 
     APP_FONT_FAMILY = "Segoe UI"
     return APP_FONT_FAMILY
+
+
+# Bundled signature typefaces (family name -> file), loaded on demand. These
+# are open-licensed (SIL OFL) script fonts shipped in ./fonts.
+SIGNATURE_FONT_FILES = [
+    ("Great Vibes", "GreatVibes-Regular.ttf"),
+    ("Allura", "Allura-Regular.ttf"),
+    ("Dancing Script", "DancingScript-Regular.ttf"),
+    ("Sacramento", "Sacramento-Regular.ttf"),
+    ("Caveat", "Caveat-Regular.ttf"),
+]
+
+_SIGNATURE_FONTS_LOADED: List[str] = []
+_SIGNATURE_FONT_PATHS: Dict[str, str] = {}
+
+
+def load_signature_fonts() -> List[str]:
+    """Register the bundled signature fonts and return the available family
+    names (falling back to the app handwriting font if none are found)."""
+    global _SIGNATURE_FONTS_LOADED
+    if _SIGNATURE_FONTS_LOADED:
+        return _SIGNATURE_FONTS_LOADED
+
+    here = Path(__file__).resolve().parent
+    families: List[str] = []
+    for expected_family, filename in SIGNATURE_FONT_FILES:
+        for base in (here / "fonts", here / "assets" / "fonts", here):
+            path = base / filename
+            if path.exists():
+                font_id = QFontDatabase.addApplicationFont(str(path))
+                fams = QFontDatabase.applicationFontFamilies(font_id)
+                if fams:
+                    families.append(fams[0])
+                    # Remember the file for each reported family so we can embed
+                    # exactly the right font into the PDF later.
+                    _SIGNATURE_FONT_PATHS[fams[0]] = str(path)
+                break
+
+    if not families:
+        # No bundled script fonts available: fall back to the app hand font so
+        # the feature still works everywhere.
+        families = [APP_FONT_FAMILY]
+
+    _SIGNATURE_FONTS_LOADED = families
+    return families
+
+
+def signature_font_file(family: str) -> Optional[str]:
+    """Return the on-disk path of the bundled signature font matching a family
+    name, so it can be embedded in a PDF via insert_textbox(fontfile=...)."""
+    if not _SIGNATURE_FONT_PATHS:
+        load_signature_fonts()
+    if family in _SIGNATURE_FONT_PATHS:
+        return _SIGNATURE_FONT_PATHS[family]
+    # Fallback: first available signature font file.
+    if _SIGNATURE_FONT_PATHS:
+        return next(iter(_SIGNATURE_FONT_PATHS.values()))
+    return None
+
+
+def font_file_for_pdf_font(pdf_font_name: str) -> Optional[str]:
+    """Match a font name found inside a PDF (e.g. 'GreatVibes-Regular', possibly
+    with a subset prefix like 'ABCDEF+GreatVibes-Regular') back to a bundled
+    signature font file, so a moved signature keeps its original typeface."""
+    if not pdf_font_name:
+        return None
+    load_signature_fonts()
+    # Strip a subset prefix ("ABCDEF+Name") if present.
+    name = pdf_font_name.split("+", 1)[-1]
+    name_l = name.lower().replace(" ", "").replace("-", "")
+    here = Path(__file__).resolve().parent
+    for _family, filename in SIGNATURE_FONT_FILES:
+        stem = Path(filename).stem.lower().replace(" ", "").replace("-", "")
+        if name_l == stem or name_l in stem or stem in name_l:
+            for base in (here / "fonts", here / "assets" / "fonts", here):
+                path = base / filename
+                if path.exists():
+                    return str(path)
+    # Also try matching against the loaded family names.
+    for family, path in _SIGNATURE_FONT_PATHS.items():
+        fam_l = family.lower().replace(" ", "").replace("-", "")
+        if name_l == fam_l or name_l in fam_l or fam_l in name_l:
+            return path
+    return None
 
 
 def asset_path(*candidates) -> Optional[Path]:
@@ -3669,11 +4816,33 @@ _apply_light_palette = _apply_bw_palette
 
 
 def main():
+    # High-DPI adaptation must be configured before the QApplication exists.
+    # PassThrough keeps fractional scaling exact so the UI stays crisp on any
+    # display resolution / scale factor (100%, 125%, 150%, 200%, ...).
+    try:
+        QApplication.setHighDpiScaleFactorRoundingPolicy(
+            Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
+        )
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
     app.setApplicationName("Suketchi PDF Reader")
     app.setStyle(SketchStyle("Fusion"))
     family = load_hand_font()
-    app.setFont(QFont(family, 11))
+    load_signature_fonts()
+
+    # Scale the base font relative to the primary screen's DPI so text is
+    # readable on both low-DPI and high-DPI monitors.
+    base_point_size = 11
+    screen = QGuiApplication.primaryScreen()
+    if screen is not None:
+        dpi = screen.logicalDotsPerInch()
+        if dpi > 0:
+            scaled = round(base_point_size * (dpi / 96.0))
+            base_point_size = max(9, min(scaled, 18))
+    app.setFont(QFont(family, base_point_size))
+
     _apply_bw_palette(app)
     icon = load_app_icon()
     if not icon.isNull():
@@ -3687,4 +4856,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
