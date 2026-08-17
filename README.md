@@ -57,4 +57,4 @@ python suketchi_pdf.py
 
 ## License
 
-This project is licensed under the GPL-3.0 License. See the LICENSE file in the root directory for more details.
+This project is licensed under the GPL-3.0 License. See the LICENSE for more details.
