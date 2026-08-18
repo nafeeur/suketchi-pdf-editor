@@ -4,6 +4,7 @@ import html
 import json
 import math
 import os
+import re
 import sys
 import textwrap
 from dataclasses import dataclass
@@ -14,10 +15,6 @@ try:
     import pymupdf as fitz
 except ImportError:
     import fitz
-
-# Silence MuPDF's noisy stderr messages (e.g. "invalid ICC colorspace",
-# "cmsOpenProfileFromMem failed") that some PDFs trigger via broken embedded
-# ICC color profiles. These are harmless warnings; rendering still succeeds.
 try:
     fitz.TOOLS.mupdf_display_errors(False)
 except Exception:
@@ -995,6 +992,142 @@ class SignatureDialog(QDialog):
                 QColor(self._color), int(self.size_spin.value()))
 
 
+class HeaderFooterDialog(QDialog):
+    """Configure header/footer text in six slots with page-number tokens."""
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setWindowTitle("Header / Footer & Page Numbers")
+        self.resize(520, 360)
+        self._color = QColor("#333333")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+
+        hint = QLabel("Use tokens:  {page}  {pages}  {date}")
+        hint.setObjectName("SmallNote")
+        layout.addWidget(hint)
+
+        form = QFormLayout()
+        self.fields: Dict[str, QLineEdit] = {}
+        labels = [
+            ("hl", "Header left:"), ("hc", "Header center:"), ("hr", "Header right:"),
+            ("fl", "Footer left:"), ("fc", "Footer center:"), ("fr", "Footer right:"),
+        ]
+        for key, label in labels:
+            line = QLineEdit()
+            self.fields[key] = line
+            form.addRow(label, line)
+        # Sensible default: page number centered in the footer.
+        self.fields["fc"].setText("Page {page} of {pages}")
+        layout.addLayout(form)
+
+        opts = QHBoxLayout()
+        opts.addWidget(QLabel("Font size:"))
+        self.size_spin = QSpinBox()
+        self.size_spin.setRange(6, 48)
+        self.size_spin.setValue(10)
+        opts.addWidget(self.size_spin)
+        opts.addWidget(QLabel("Margin:"))
+        self.margin_spin = QSpinBox()
+        self.margin_spin.setRange(6, 120)
+        self.margin_spin.setValue(24)
+        opts.addWidget(self.margin_spin)
+        opts.addWidget(QLabel("Color:"))
+        self.color_button = SketchSwatchButton("Color")
+        self.color_button.set_swatch(self._color)
+        self.color_button.clicked.connect(self._choose_color)
+        opts.addWidget(self.color_button)
+        opts.addStretch()
+        layout.addLayout(opts)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _choose_color(self):
+        color = QColorDialog.getColor(self._color, self, "Text Color")
+        if color.isValid():
+            self._color = color
+            self.color_button.set_swatch(color)
+
+    def values(self) -> Dict:
+        return {
+            "slots": {k: v.text().strip() for k, v in self.fields.items()},
+            "size": self.size_spin.value(),
+            "margin": self.margin_spin.value(),
+            "color": QColor(self._color),
+        }
+
+
+class FormFillDialog(QDialog):
+    """Edit the values of a PDF's interactive form fields (AcroForm widgets).
+
+    `fields` is a list of dicts: {page, index, name, type, value, choices}.
+    """
+
+    def __init__(self, parent: QWidget, fields: List[Dict]):
+        super().__init__(parent)
+        self.setWindowTitle("Fill Form Fields")
+        self.resize(560, 520)
+        self._fields = fields
+        self._editors: List = []
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        form = QFormLayout(inner)
+        form.setContentsMargins(4, 4, 4, 4)
+
+        for f in fields:
+            ftype = f["type"]
+            label = f["name"] or f"(field on p.{f['page']+1})"
+            if ftype == "checkbox":
+                editor = QCheckBox()
+                editor.setChecked(str(f["value"]).lower() not in ("off", "", "false", "no", "0"))
+            elif ftype in ("combobox", "listbox") and f.get("choices"):
+                editor = QComboBox()
+                editor.setEditable(ftype == "combobox")
+                editor.addItems([str(c) for c in f["choices"]])
+                cur = str(f["value"] or "")
+                idx = editor.findText(cur)
+                if idx >= 0:
+                    editor.setCurrentIndex(idx)
+                elif cur:
+                    editor.setEditText(cur)
+            else:  # text and everything else
+                editor = QLineEdit()
+                editor.setText(str(f["value"] or ""))
+            self._editors.append(editor)
+            form.addRow(label + ":", editor)
+
+        scroll.setWidget(inner)
+        layout.addWidget(scroll)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def result_values(self) -> List[Dict]:
+        out = []
+        for f, editor in zip(self._fields, self._editors):
+            if isinstance(editor, QCheckBox):
+                val = editor.isChecked()
+            elif isinstance(editor, QComboBox):
+                val = editor.currentText()
+            else:
+                val = editor.text()
+            out.append({**f, "new_value": val})
+        return out
+
+
 class PasswordDialog(QDialog):
     def __init__(self, parent: QWidget, title: str = "Password Required"):
         super().__init__(parent)
@@ -1034,6 +1167,7 @@ class PageCanvas(QWidget):
         self.xray_text: List[QRectF] = []
         self.xray_image: List[QRectF] = []
         self.xray_vector: List[QRectF] = []
+        self.spell_rects: List[QRectF] = []
         self.stroke_color = QColor("#257A6C")
         self.fill_color = QColor("#e7f0ee")
         self.text_color = QColor("#1c1a17")
@@ -1048,6 +1182,8 @@ class PageCanvas(QWidget):
         self.setMouseTracking(True)
         self.setMinimumSize(850, 1000)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # Accept keyboard focus so Delete can remove a selected annotation.
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     def set_page(
         self,
@@ -1057,12 +1193,14 @@ class PageCanvas(QWidget):
         edit_rects: Optional[List[QRectF]] = None,
         crop_preview_rect: Optional[QRectF] = None,
         xray: Optional[Dict[str, List[QRectF]]] = None,
+        spell_rects: Optional[List[QRectF]] = None,
     ):
         self.pixmap = pixmap
         self.zoom = zoom
         self.search_rects = search_rects or []
         self.edit_rects = edit_rects or []
         self.crop_preview_rect = crop_preview_rect
+        self.spell_rects = spell_rects or []
         xray = xray or {}
         self.xray_text = xray.get("text", [])
         self.xray_image = xray.get("image", [])
@@ -1091,6 +1229,31 @@ class PageCanvas(QWidget):
         self.text_color = QColor(text_color)
         self.line_width = max(1, int(line_width))
         self.update()
+
+    @staticmethod
+    def _squiggle_path(rect: QRectF) -> QPainterPath:
+        """A doodly, hand-drawn squiggly underline spanning the word's width,
+        sitting just below its baseline."""
+        path = QPainterPath()
+        y = rect.bottom() + 2.0
+        x0 = rect.left()
+        x1 = rect.right()
+        amp = 2.4          # squiggle height
+        step = 4.5         # horizontal wavelength
+        rnd = random.Random(stable_seed("spell", int(rect.left()), int(rect.bottom())))
+        path.moveTo(x0, y)
+        x = x0
+        up = True
+        while x < x1:
+            nx = min(x + step, x1)
+            midx = (x + nx) / 2
+            # Alternating control points create the up/down wobble, with a
+            # little random jitter so it looks drawn by hand.
+            cy = y - amp + rnd.uniform(-0.5, 0.5) if up else y + amp + rnd.uniform(-0.5, 0.5)
+            path.quadTo(midx, cy, nx, y + rnd.uniform(-0.4, 0.4))
+            up = not up
+            x = nx
+        return path
 
     def sizeHint(self) -> QSize:
         if self.pixmap is None:
@@ -1191,6 +1354,15 @@ class PageCanvas(QWidget):
             painter.setBrush(QColor(0, 0, 0, 18))
             painter.drawRect(self.crop_preview_rect)
 
+        # Spell-check: a hand-drawn squiggly underline beneath misspelled words.
+        if self.spell_rects:
+            pen = QPen(QColor(210, 40, 40), 2.6, Qt.PenStyle.SolidLine,
+                       Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            for rect in self.spell_rects:
+                painter.drawPath(self._squiggle_path(rect))
+
         if self._drag_start and self._drag_current:
             temp = QRectF(self._drag_start, self._drag_current).normalized()
             if self.tool == Tool.REDACT:
@@ -1262,10 +1434,25 @@ class PageCanvas(QWidget):
 
     def mouseDoubleClickEvent(self, event):
         if self.pixmap is not None and event.button() == Qt.MouseButton.LeftButton:
+            # In the Select/Move tool, double-click recolours the annotation
+            # under the cursor; otherwise it fits the page width.
+            if self.tool == Tool.MOVE_TEXT:
+                p = self._event_to_image_point(event)
+                if p is not None and self.callback("__recolor_annot__", p):
+                    event.accept()
+                    return
             self.callback("__fit_width__", None)
             event.accept()
             return
         super().mouseDoubleClickEvent(event)
+
+    def keyPressEvent(self, event):
+        # Delete/Backspace removes the currently selected annotation.
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if self.callback("__delete_selected_annot__", None):
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     def mousePressEvent(self, event):
         if self.pixmap is None:
@@ -1288,6 +1475,7 @@ class PageCanvas(QWidget):
             return
 
         if self.tool == Tool.MOVE_TEXT:
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
             ok = bool(self.callback("__move_text_start__", p))
             if ok:
                 self._drag_start = p
@@ -1722,6 +1910,7 @@ class PdfStudioOverhaulPro(QMainWindow):
         self.search_index = -1
         self.pending_image_path: Optional[str] = None
         self.pending_signature: Optional[Dict] = None
+        self._selected_annot: Optional[Tuple[int, int]] = None
         self.signatures: List[Dict] = []
         self.undo_stack: List[bytes] = []
         self.redo_stack: List[bytes] = []
@@ -1738,6 +1927,8 @@ class PdfStudioOverhaulPro(QMainWindow):
         self._render_cache_order: List[Tuple[int, float, int]] = []
         self.xray_enabled = False
         self._xray_cache: Dict[Tuple[int, int, int], Dict[str, List[QRectF]]] = {}
+        self.spellcheck_enabled = False
+        self._spell_cache: Dict[Tuple[int, int, int], List[QRectF]] = {}
 
         # Open documents, one per tab (Acrobat-style). self.doc etc. always
         # mirror the active tab so all existing logic keeps working unchanged.
@@ -1800,14 +1991,22 @@ class PdfStudioOverhaulPro(QMainWindow):
         self.page_list = QListWidget()
         self.page_list.setIconSize(QSize(96, 130))
         self.page_list.currentRowChanged.connect(self.on_page_selected)
+        # Drag-to-reorder pages (Combine/Organize).
+        self.page_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        self.page_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.page_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.page_list.model().rowsMoved.connect(self._on_pages_reordered)
+        self._suppress_page_reorder = False
 
         self.outline_list = QListWidget()
         self.outline_list.itemClicked.connect(self.go_to_outline_item)
+        outline_panel = self._build_outline_panel()
 
         search_panel = self._build_search_panel()
 
         self.comments_list = QListWidget()
         self.comments_list.itemClicked.connect(self.go_to_comment_item)
+        notes_panel = self._build_notes_panel()
 
         self.sidebar = QTabWidget()
         self.sidebar.setObjectName("SidebarTabs")
@@ -1816,9 +2015,9 @@ class PdfStudioOverhaulPro(QMainWindow):
         self.sidebar.setUsesScrollButtons(False)
         self.sidebar.tabBar().setExpanding(True)
         self.sidebar.addTab(self.page_list, "Pages")
-        self.sidebar.addTab(self.outline_list, "Outline")
+        self.sidebar.addTab(outline_panel, "Outline")
         self.sidebar.addTab(search_panel, "Find")
-        self.sidebar.addTab(self.comments_list, "Notes")
+        self.sidebar.addTab(notes_panel, "Notes")
 
         self.canvas = PageCanvas(self.handle_canvas_action)
         self.scroll = QScrollArea()
@@ -1902,6 +2101,10 @@ class PdfStudioOverhaulPro(QMainWindow):
 
         self.file_menu_button = self._menu_button("File", [
             ("Save Encrypted Copy…", self.save_encrypted_copy),
+            ("Reduce File Size…", self.compress_pdf),
+            None,
+            ("Digitally Sign (.p12 / .pfx)…", self.digitally_sign),
+            ("Verify Digital Signatures…", self.verify_signatures),
             None,
             ("Document Properties…", self.show_document_info),
             ("Edit Metadata…", self.edit_metadata),
@@ -1910,6 +2113,7 @@ class PdfStudioOverhaulPro(QMainWindow):
 
         self.edit_menu_button = self._menu_button("Edit", [
             ("Find and Replace…", self.search_and_replace),
+            ("Fill Form Fields…", self.fill_form_fields),
             None,
             ("Reflow Current Page", self.reflow_current_page_to_new_page),
             ("Reflow Whole Document…", self.reflow_document_to_new_pdf),
@@ -1921,6 +2125,9 @@ class PdfStudioOverhaulPro(QMainWindow):
             ("Signature…", self.prepare_signature),
             ("Watermark…", self.add_watermark),
             ("Stamp…", self.add_stamp),
+            None,
+            ("Header / Footer & Page Numbers…", self.add_header_footer),
+            ("Bates Numbering…", self.add_bates_numbering),
             None,
             ("Blank Page", self.insert_blank_page),
             ("Merge PDF After This Page…", self.insert_pdf_after_current),
@@ -1936,6 +2143,9 @@ class PdfStudioOverhaulPro(QMainWindow):
             None,
             ("Duplicate Page", self.duplicate_current_page),
             ("Delete Page", self.delete_current_page),
+            None,
+            ("Insert File Before This Page…", lambda: self.insert_pdf_at(before=True)),
+            ("Insert File After This Page…", lambda: self.insert_pdf_at(before=False)),
             None,
             ("Extract Page Range…", self.extract_page_range),
             ("Split Into Single Pages…", self.split_every_page),
@@ -1979,6 +2189,16 @@ class PdfStudioOverhaulPro(QMainWindow):
         )
         self.xray_button.toggled.connect(self.toggle_xray)
         top.addWidget(self.xray_button)
+
+        self.spell_button = QToolButton()
+        self.spell_button.setObjectName("ToolButton")
+        self.spell_button.setText("Spell")
+        self.spell_button.setCheckable(True)
+        self.spell_button.setToolTip(
+            "Spell check: underline misspelled words with a squiggly line"
+        )
+        self.spell_button.toggled.connect(self.toggle_spellcheck)
+        top.addWidget(self.spell_button)
         top.addSeparator()
 
         self.zoom_out_action = self._add_action(top, "−", self.zoom_out, "Ctrl+-")
@@ -2071,6 +2291,69 @@ class PdfStudioOverhaulPro(QMainWindow):
         layout.addWidget(self.search_results_list)
         return panel
 
+    def _build_outline_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        layout.addWidget(self.outline_list)
+
+        row1 = QHBoxLayout()
+        row1.setContentsMargins(0, 0, 0, 0)
+        row1.setSpacing(6)
+        add_btn = QPushButton("Add")
+        add_btn.setToolTip("Add a bookmark to the current page")
+        add_btn.clicked.connect(self.add_bookmark)
+        rename_btn = QPushButton("Rename")
+        rename_btn.clicked.connect(self.rename_bookmark)
+        del_btn = QPushButton("Delete")
+        del_btn.clicked.connect(self.delete_bookmark)
+        row1.addWidget(add_btn)
+        row1.addWidget(rename_btn)
+        row1.addWidget(del_btn)
+        layout.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        row2.setContentsMargins(0, 0, 0, 0)
+        row2.setSpacing(6)
+        up_btn = QPushButton("↑ Up")
+        up_btn.clicked.connect(lambda: self.move_bookmark(-1))
+        down_btn = QPushButton("↓ Down")
+        down_btn.clicked.connect(lambda: self.move_bookmark(1))
+        indent_btn = QPushButton("→ Indent")
+        indent_btn.clicked.connect(lambda: self.indent_bookmark(1))
+        outdent_btn = QPushButton("← Outdent")
+        outdent_btn.clicked.connect(lambda: self.indent_bookmark(-1))
+        row2.addWidget(up_btn)
+        row2.addWidget(down_btn)
+        layout.addLayout(row2)
+        row3 = QHBoxLayout()
+        row3.setContentsMargins(0, 0, 0, 0)
+        row3.setSpacing(6)
+        row3.addWidget(indent_btn)
+        row3.addWidget(outdent_btn)
+        layout.addLayout(row3)
+        return panel
+
+    def _build_notes_panel(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        layout.addWidget(self.comments_list)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        del_btn = QPushButton("Delete")
+        del_btn.setToolTip("Delete the selected annotation")
+        del_btn.clicked.connect(self.delete_selected_annotation)
+        del_all_btn = QPushButton("Delete All")
+        del_all_btn.clicked.connect(self.delete_all_annotations)
+        row.addWidget(del_btn)
+        row.addWidget(del_all_btn)
+        layout.addLayout(row)
+        return panel
+
     TOOL_SHORT_LABELS = {
         Tool.SELECT: "Select",
         Tool.TEXT_BOX: "Text Box",
@@ -2115,7 +2398,7 @@ class PdfStudioOverhaulPro(QMainWindow):
         Tool.TEXT_BOX: "Drag a box, then type the text to draw inside it.",
         Tool.EDIT_TEXT: "Click a word to replace it. Its original size and colour are reused.",
         Tool.EDIT_BLOCK: "Click a paragraph to replace the whole block.",
-        Tool.MOVE_TEXT: "Drag a signature or text box you added to a new position.",
+        Tool.MOVE_TEXT: "Drag a signature, text box, or annotation. Double-click to recolour, Delete to remove.",
         Tool.NOTE: "Click to drop a sticky note comment.",
         Tool.HIGHLIGHT: "Drag across text to highlight it.",
         Tool.UNDERLINE: "Drag across text to underline it.",
@@ -2465,6 +2748,7 @@ class PdfStudioOverhaulPro(QMainWindow):
             self.fill_color_button,
         ]
         widgets.append(self.xray_button)
+        widgets.append(self.spell_button)
         widgets.extend(self.tool_buttons.values())
         for widget in widgets:
             widget.setEnabled(enabled)
@@ -2565,6 +2849,9 @@ class PdfStudioOverhaulPro(QMainWindow):
         self._xray_cache = tab.xray_cache
         self._page_structure_changed = tab.page_structure_changed
         self.signatures = getattr(tab, "signatures", [])
+        # Spell-check rects are per (doc-version, page, zoom); clear on switch so
+        # a different document never reuses another's cached rects.
+        self._spell_cache = {}
 
         self.search_results_list.clear()
         self._set_document_controls(True)
@@ -2709,6 +2996,132 @@ class PdfStudioOverhaulPro(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Encryption Error", f"Could not save encrypted copy:\n{exc}")
 
+    def digitally_sign(self):
+        """Apply a cryptographic (PKCS#7) digital signature using a PKCS#12
+        (.p12/.pfx) certificate. The signed copy is written to a new file."""
+        if self.doc is None:
+            return
+        if not pyhanko_available():
+            QMessageBox.information(
+                self, "Digital Signing Unavailable",
+                "Cryptographic signing needs the pyHanko package.\n\n"
+                "Install it with:\n    pip install pyHanko",
+            )
+            return
+
+        cert_path, _ = QFileDialog.getOpenFileName(
+            self, "Select Signing Certificate", "",
+            "PKCS#12 Certificates (*.p12 *.pfx)")
+        if not cert_path:
+            return
+        passphrase, ok = QInputDialog.getText(
+            self, "Certificate Password", "Password for the certificate:",
+            QLineEdit.EchoMode.Password)
+        if not ok:
+            return
+
+        default = "signed.pdf"
+        if self.file_path:
+            src = Path(self.file_path)
+            default = str(src.with_name(f"{src.stem}_signed.pdf"))
+        out, _ = QFileDialog.getSaveFileName(self, "Save Signed PDF As", default, "PDF Files (*.pdf)")
+        if not out:
+            return
+        if not out.lower().endswith(".pdf"):
+            out += ".pdf"
+
+        try:
+            from pyhanko.sign import signers
+            from pyhanko.sign.signers import PdfSignatureMetadata
+            from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+            import io
+
+            signer = signers.SimpleSigner.load_pkcs12(
+                cert_path, passphrase=passphrase.encode("utf-8") if passphrase else None)
+            if signer is None:
+                raise ValueError("Could not load the certificate (wrong password?).")
+
+            # Sign the current in-memory document (captures unsaved edits).
+            pdf_bytes = self.doc.tobytes(garbage=4, deflate=True)
+            reader = IncrementalPdfFileWriter(io.BytesIO(pdf_bytes))
+            # Count existing signatures to pick a fresh, unique field name.
+            try:
+                from pyhanko.pdf_utils.reader import PdfFileReader
+                existing = len(list(PdfFileReader(io.BytesIO(pdf_bytes)).embedded_signatures))
+            except Exception:
+                existing = 0
+            field_name = "Signature%d" % (existing + 1)
+            meta = PdfSignatureMetadata(field_name=field_name, reason="Approved", location="")
+            with open(out, "wb") as outf:
+                signers.sign_pdf(reader, meta, signer=signer, output=outf)
+
+            QMessageBox.information(
+                self, "Digitally Signed",
+                f"Signed PDF saved:\n{out}\n\nField: {field_name}")
+            self.status.showMessage(f"Digitally signed: {out}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Signing Error", f"Could not sign the PDF:\n{exc}")
+
+    def verify_signatures(self):
+        """Report the cryptographic status of any digital signatures in the
+        current PDF (intact / valid / trusted)."""
+        if self.doc is None:
+            return
+        if not pyhanko_available():
+            QMessageBox.information(
+                self, "Verification Unavailable",
+                "Signature verification needs the pyHanko package.\n\n"
+                "Install it with:\n    pip install pyHanko",
+            )
+            return
+        try:
+            from pyhanko.pdf_utils.reader import PdfFileReader
+            from pyhanko.sign.validation import validate_pdf_signature
+            from pyhanko_certvalidator import ValidationContext
+            import io
+
+            # Verify the bytes exactly as stored on disk — re-serialising via
+            # PyMuPDF would change the byte ranges and break the integrity check.
+            if self.is_dirty or not self.file_path or not os.path.exists(self.file_path):
+                QMessageBox.information(
+                    self, "Verify Signatures",
+                    "Please save (or open) the PDF file first, then verify.\n\n"
+                    "Signatures must be checked against the exact bytes on disk.")
+                return
+            with open(self.file_path, "rb") as fh:
+                reader = PdfFileReader(io.BytesIO(fh.read()))
+            sigs = list(reader.embedded_signatures)
+            if not sigs:
+                QMessageBox.information(self, "Verify Signatures", "This PDF has no digital signatures.")
+                return
+
+            # No external trust roots configured → trust status will be False,
+            # but integrity (intact) and validity are still meaningful.
+            vc = ValidationContext(allow_fetching=False)
+            lines = []
+            for s in sigs:
+                try:
+                    status = validate_pdf_signature(s, vc)
+                    signer_name = ""
+                    try:
+                        signer_name = status.signing_cert.subject.human_friendly
+                    except Exception:
+                        pass
+                    lines.append(
+                        f"• {s.field_name}: "
+                        f"{'intact' if status.intact else 'MODIFIED'}, "
+                        f"{'valid' if status.valid else 'invalid'}"
+                        + (f"\n    Signer: {signer_name}" if signer_name else "")
+                    )
+                except Exception as exc:
+                    lines.append(f"• {s.field_name}: could not validate ({exc})")
+
+            QMessageBox.information(
+                self, "Digital Signatures",
+                "\n".join(lines) + "\n\n(Trust depends on your installed certificate authorities.)")
+        except Exception as exc:
+            QMessageBox.critical(self, "Verification Error", f"Could not verify signatures:\n{exc}")
+
     def _document_worker_source(self) -> Optional[Dict[str, object]]:
         """Create a thread-safe document source for background workers.
 
@@ -2840,6 +3253,54 @@ class PdfStudioOverhaulPro(QMainWindow):
         else:
             self.status.showMessage("X-ray off")
 
+    def toggle_spellcheck(self, enabled: bool):
+        enabled = bool(enabled)
+        if enabled and not spell_checker_available():
+            self.spell_button.blockSignals(True)
+            self.spell_button.setChecked(False)
+            self.spell_button.blockSignals(False)
+            QMessageBox.information(
+                self, "Spell Check Unavailable",
+                "No dictionary is available for spell checking.\n\n"
+                "Install one with:\n    pip install pyspellchecker",
+            )
+            return
+        self.spellcheck_enabled = enabled
+        if self.doc is not None:
+            self.render_current_page()
+        if enabled:
+            self.status.showMessage("Spell check on — misspelled words are underlined")
+        else:
+            self.status.showMessage("Spell check off")
+
+    def _compute_spellcheck(self, page) -> List[QRectF]:
+        """Return image-space rects for every misspelled word on the page.
+
+        Cached per (document version, page, zoom) since word extraction and
+        dictionary lookups are relatively expensive.
+        """
+        key = (self._doc_version, self.current_page_index, int(self.zoom * 1000))
+        cached = self._spell_cache.get(key)
+        if cached is not None:
+            return cached
+
+        rects: List[QRectF] = []
+        try:
+            # words: (x0, y0, x1, y1, "word", block, line, word_no)
+            for w in page.get_text("words"):
+                x0, y0, x1, y1, token = w[0], w[1], w[2], w[3], w[4]
+                # A PDF "word" may bundle punctuation; check each alpha run.
+                if not any(is_word_misspelled(m.group(0)) for m in _WORD_RE.finditer(token)):
+                    continue
+                rects.append(self._pdf_rect_to_image_rect(fitz.Rect(x0, y0, x1, y1)))
+        except Exception:
+            pass
+
+        self._spell_cache[key] = rects
+        if len(self._spell_cache) > 12:
+            self._spell_cache.pop(next(iter(self._spell_cache)))
+        return rects
+
     def render_current_page(self):
         if self.doc is None:
             return
@@ -2884,9 +3345,10 @@ class PdfStudioOverhaulPro(QMainWindow):
                 crop_preview = self._pdf_rect_to_image_rect(page.cropbox)
 
             xray = self._compute_xray(page) if self.xray_enabled else None
+            spell_rects = self._compute_spellcheck(page) if self.spellcheck_enabled else None
 
             self.canvas.set_style(self.annotation_color, self.fill_color, self.text_color, self.line_width)
-            self.canvas.set_page(qpix, self.zoom, search_rects, edit_rects, crop_preview, xray)
+            self.canvas.set_page(qpix, self.zoom, search_rects, edit_rects, crop_preview, xray, spell_rects)
 
             self.page_list.blockSignals(True)
             self.page_list.setCurrentRow(self.current_page_index)
@@ -2962,12 +3424,123 @@ class PdfStudioOverhaulPro(QMainWindow):
             if not toc:
                 self.outline_list.addItem("No outline/bookmarks found.")
                 return
-            for level, title, page_num in toc:
-                item = QListWidgetItem(("  " * max(level - 1, 0)) + title)
+            for idx, (level, title, page_num) in enumerate(toc):
+                item = QListWidgetItem(("   " * max(level - 1, 0)) + "• " + title)
+                # UserRole = target page (0-based); UserRole+1 = TOC row index.
                 item.setData(Qt.ItemDataRole.UserRole, max(page_num - 1, 0))
+                item.setData(Qt.ItemDataRole.UserRole + 1, idx)
                 self.outline_list.addItem(item)
         except Exception:
             self.outline_list.addItem("Could not read outline.")
+
+    def _current_toc(self) -> List[list]:
+        try:
+            return self.doc.get_toc() if self.doc is not None else []
+        except Exception:
+            return []
+
+    def _selected_toc_index(self) -> int:
+        item = self.outline_list.currentItem()
+        if item is None:
+            return -1
+        idx = item.data(Qt.ItemDataRole.UserRole + 1)
+        return idx if isinstance(idx, int) else -1
+
+    def _apply_toc(self, toc: List[list], keep_index: int = -1):
+        try:
+            self.doc.set_toc(toc)
+        except Exception as exc:
+            QMessageBox.critical(self, "Bookmarks", f"Could not update bookmarks:\n{exc}")
+            return
+        self._mark_dirty("Bookmarks updated")
+        self.refresh_outline()
+        if 0 <= keep_index < self.outline_list.count():
+            self.outline_list.setCurrentRow(keep_index)
+
+    def add_bookmark(self):
+        if self.doc is None:
+            return
+        title, ok = QInputDialog.getText(
+            self, "Add Bookmark", "Bookmark title:",
+            text=f"Page {self.current_page_index + 1}")
+        if not ok or not title.strip():
+            return
+        toc = self._current_toc()
+        # Insert after the selected entry (same level), else append at level 1.
+        sel = self._selected_toc_index()
+        entry = [1, title.strip(), self.current_page_index + 1]
+        if 0 <= sel < len(toc):
+            entry[0] = toc[sel][0]
+            toc.insert(sel + 1, entry)
+            keep = sel + 1
+        else:
+            toc.append(entry)
+            keep = len(toc) - 1
+        self._apply_toc(toc, keep)
+
+    def rename_bookmark(self):
+        if self.doc is None:
+            return
+        toc = self._current_toc()
+        sel = self._selected_toc_index()
+        if not (0 <= sel < len(toc)):
+            QMessageBox.information(self, "Rename Bookmark", "Select a bookmark first.")
+            return
+        title, ok = QInputDialog.getText(self, "Rename Bookmark", "New title:", text=toc[sel][1])
+        if not ok or not title.strip():
+            return
+        toc[sel][1] = title.strip()
+        self._apply_toc(toc, sel)
+
+    def delete_bookmark(self):
+        if self.doc is None:
+            return
+        toc = self._current_toc()
+        sel = self._selected_toc_index()
+        if not (0 <= sel < len(toc)):
+            QMessageBox.information(self, "Delete Bookmark", "Select a bookmark first.")
+            return
+        toc.pop(sel)
+        toc = self._normalise_toc_levels(toc)
+        self._apply_toc(toc, min(sel, len(toc) - 1))
+
+    def move_bookmark(self, direction: int):
+        if self.doc is None:
+            return
+        toc = self._current_toc()
+        sel = self._selected_toc_index()
+        j = sel + direction
+        if not (0 <= sel < len(toc)) or not (0 <= j < len(toc)):
+            return
+        toc[sel], toc[j] = toc[j], toc[sel]
+        # Repair the level hierarchy: the first entry must be level 1 and no
+        # entry may be more than one level deeper than the one before it, or
+        # set_toc rejects it.
+        toc = self._normalise_toc_levels(toc)
+        self._apply_toc(toc, j)
+
+    @staticmethod
+    def _normalise_toc_levels(toc: List[list]) -> List[list]:
+        prev = 0
+        for entry in toc:
+            entry[0] = max(1, min(entry[0], prev + 1))
+            prev = entry[0]
+        return toc
+
+    def indent_bookmark(self, delta: int):
+        if self.doc is None:
+            return
+        toc = self._current_toc()
+        sel = self._selected_toc_index()
+        if not (0 <= sel < len(toc)):
+            return
+        new_level = toc[sel][0] + delta
+        # Level 1 is the minimum; a child can be at most one deeper than the
+        # entry above it (PDF TOC rule).
+        max_level = (toc[sel - 1][0] + 1) if sel > 0 else 1
+        new_level = max(1, min(new_level, max_level))
+        toc[sel][0] = new_level
+        self._apply_toc(toc, sel)
 
     def refresh_comments(self):
         self.comments_list.clear()
@@ -2977,18 +3550,24 @@ class PdfStudioOverhaulPro(QMainWindow):
         found = 0
         for page_index in range(self.doc.page_count):
             page = self.doc[page_index]
-            annot = page.first_annot
-            while annot:
+            for ordinal, annot in enumerate(page.annots()):
                 found += 1
-                text = f"Page {page_index + 1}: {annot.type[1]}"
-                info = annot.info or {}
+                try:
+                    atype = annot.type[1]
+                    info = annot.info or {}
+                except Exception:
+                    continue
+                text = f"Page {page_index + 1}: {atype}"
                 content = info.get("content") or info.get("title") or ""
                 if content:
                     text += f" — {content[:60]}"
                 item = QListWidgetItem(text)
                 item.setData(Qt.ItemDataRole.UserRole, page_index)
+                # Store the annotation's ORDINAL position on its page. Xrefs are
+                # renumbered when the document is re-serialised (undo snapshot),
+                # but the ordinal order is stable, so we delete by position.
+                item.setData(Qt.ItemDataRole.UserRole + 1, ordinal)
                 self.comments_list.addItem(item)
-                annot = annot.next
         if found == 0:
             self.comments_list.addItem("No comments or annotations found.")
 
@@ -3013,6 +3592,70 @@ class PdfStudioOverhaulPro(QMainWindow):
         if isinstance(page_index, int):
             self.current_page_index = page_index
             self.render_current_page()
+
+    def delete_selected_annotation(self):
+        if self.doc is None:
+            return
+        item = self.comments_list.currentItem()
+        if item is None:
+            QMessageBox.information(self, "Delete Annotation", "Select an annotation in the list first.")
+            return
+        page_index = item.data(Qt.ItemDataRole.UserRole)
+        ordinal = item.data(Qt.ItemDataRole.UserRole + 1)
+        if not isinstance(page_index, int) or not isinstance(ordinal, int) or ordinal < 0:
+            return
+        self._push_undo()
+        page = self.doc[page_index]
+        removed = False
+        try:
+            annots = list(page.annots())
+            if 0 <= ordinal < len(annots):
+                page.delete_annot(annots[ordinal])
+                removed = True
+        except Exception:
+            removed = False
+        try:
+            self.doc.reload_page(page)
+        except Exception:
+            pass
+        if removed:
+            self._mark_dirty("Annotation deleted", refresh_sidebars=True)
+        else:
+            QMessageBox.information(self, "Delete Annotation", "That annotation could not be found (it may have already been removed).")
+
+    def delete_all_annotations(self):
+        if self.doc is None:
+            return
+        total = sum(1 for pi in range(self.doc.page_count) for _ in self.doc[pi].annots())
+        if total == 0:
+            QMessageBox.information(self, "Delete All Annotations", "This document has no annotations.")
+            return
+        if QMessageBox.question(
+            self, "Delete All Annotations",
+            f"Remove all {total} annotation(s) from the document?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._push_undo()
+        for pi in range(self.doc.page_count):
+            page = self.doc[pi]
+            # Repeatedly delete the first annotation until none remain; fetching
+            # a fresh list each time avoids stale handles after mutation.
+            guard = 0
+            while True:
+                annots = list(page.annots())
+                if not annots or guard > 10000:
+                    break
+                try:
+                    page.delete_annot(annots[0])
+                except Exception:
+                    break
+                guard += 1
+            try:
+                self.doc.reload_page(page)
+            except Exception:
+                pass
+        self._mark_dirty("All annotations deleted", refresh_sidebars=True)
 
     def set_tool(self, tool: str):
         self.current_tool = tool
@@ -3071,6 +3714,10 @@ class PdfStudioOverhaulPro(QMainWindow):
             if tool == "__move_text_end__":
                 self.end_move_text(payload)
                 return True
+            if tool == "__recolor_annot__":
+                return self.recolor_annotation_at(payload)
+            if tool == "__delete_selected_annot__":
+                return self.delete_selected_annot_on_canvas()
 
             if tool == Tool.TEXT_BOX:
                 self.add_text_box(payload)
@@ -3122,11 +3769,9 @@ class PdfStudioOverhaulPro(QMainWindow):
         pdf_point = fitz.Point(image_point.x() / self.zoom, image_point.y() / self.zoom)
         self._moving_image_hit = None
         self._moving_signature_index = None
+        self._moving_annot_ordinal = None
 
-        # The Move tool only repositions items YOU added (signatures and text
-        # boxes), which are tracked with clean source data. Existing PDF body
-        # text is left alone, because re-inserting arbitrary embedded/subset
-        # fonts corrupts the text on repeated moves.
+        # 1. Tracked items (signatures / text boxes) — redrawn from clean data.
         sig_index = self._find_signature_at_point(self.current_page_index, pdf_point)
         if sig_index is not None:
             self._moving_text_hit = None
@@ -3135,9 +3780,40 @@ class PdfStudioOverhaulPro(QMainWindow):
             self.status.showMessage("Move: dragging %s" % ("text box" if kind == "textbox" else "signature"))
             return True
 
+        # 2. Native PDF annotations (highlight, note, rectangle, ink, …). These
+        # move cleanly via set_rect, so they can be repositioned in place.
+        ordinal = self._find_annot_at_point(self.current_page_index, pdf_point)
+        if ordinal is not None:
+            self._moving_text_hit = None
+            self._moving_annot_ordinal = ordinal
+            self._selected_annot = (self.current_page_index, ordinal)
+            self.status.showMessage("Move: dragging annotation (Del to delete, double-click to recolour)")
+            return True
+
         self._moving_text_hit = None
-        self.status.showMessage("Move: click a signature or text box you added.")
+        self._selected_annot = None
+        self.status.showMessage("Move: click a signature, text box or annotation.")
         return False
+
+    def _find_annot_at_point(self, page_index: int, point: fitz.Point) -> Optional[int]:
+        """Return the ordinal index of the top-most annotation whose rectangle
+        contains the point on the given page (or None)."""
+        try:
+            page = self.doc[page_index]
+        except Exception:
+            return None
+        tol = fitz.Rect(point.x - 2, point.y - 2, point.x + 2, point.y + 2)
+        best = None
+        for ordinal, annot in enumerate(page.annots()):
+            try:
+                r = fitz.Rect(annot.rect)
+            except Exception:
+                continue
+            if r.is_empty or r.is_infinite:
+                continue
+            if r.contains(point) or r.intersects(tol):
+                best = ordinal  # later annots draw on top
+        return best
 
     def _find_image_at_point(self, page, point: fitz.Point) -> Optional[Dict]:
         """Return info for the top-most image whose placement contains the
@@ -3204,32 +3880,152 @@ class PdfStudioOverhaulPro(QMainWindow):
             sig = self.signatures[sig_index]
             page = self.doc[self.current_page_index]
             old_rect = fitz.Rect(sig["rect"])
-            size = float(sig.get("size", 48))
-            # The stored rect already covers the drawn glyphs generously; a
-            # small extra margin guarantees the script-font tails are cleared.
-            erase = old_rect + (-2, -2, size * 0.3, 2)
             self._push_undo()
+            page = self.doc[self.current_page_index]
+
+            if sig.get("kind") == "signature" and sig.get("png"):
+                # Image signature: remove the old image, then place the SAME PNG
+                # at the shifted rect. Re-using the stored bytes means it never
+                # corrupts, and redaction keeps the file from accumulating
+                # hidden copies. (We always re-insert, so removal is safe.)
+                new_rect = old_rect + (dx, dy, dx, dy)
+                try:
+                    page.add_redact_annot(old_rect + (-2, -2, 2, 2), fill=(1, 1, 1))
+                    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_REMOVE)
+                    self.doc.reload_page(page)
+                    page = self.doc[self.current_page_index]
+                except Exception:
+                    try:
+                        page.draw_rect(old_rect + (-2, -2, 2, 2), color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+                    except Exception:
+                        pass
+                page.insert_image(new_rect, stream=sig["png"],
+                                  keep_proportion=False, overlay=True)
+                sig = dict(sig)
+                sig["rect"] = [new_rect.x0, new_rect.y0, new_rect.x1, new_rect.y1]
+                self.signatures[sig_index] = sig
+                self._mark_dirty("Signature moved", refresh_sidebars=True)
+                return
+
+            # Text box: erase old text and redraw fresh Helvetica text.
+            size = float(sig.get("size", 48))
+            erase = old_rect + (-2, -2, size * 0.3, 2)
             page.add_redact_annot(erase, fill=(1, 1, 1))
             page.apply_redactions()
             self.signatures.pop(sig_index)
             col = sig.get("color", [17, 17, 17])
             color = QColor(col[0], col[1], col[2])
-            # old_rect.x0/y0 include the padding applied at draw time; recover
-            # the original insertion point so the move offset stays accurate.
             self._draw_signature(
                 page, self.current_page_index,
                 old_rect.x0 + dx + size * 0.1, old_rect.y0 + dy + size * 0.2,
                 sig["name"], sig.get("fontfile"), size, color,
-                kind=sig.get("kind", "signature"), align=sig.get("align", 0),
+                kind="textbox", align=sig.get("align", 0),
             )
-            label = "Text box moved" if sig.get("kind") == "textbox" else "Signature moved"
-            self._mark_dirty(label, refresh_sidebars=True)
+            self._mark_dirty("Text box moved", refresh_sidebars=True)
+            return
+
+        # --- Moving a native PDF annotation via set_rect ---
+        ordinal = getattr(self, "_moving_annot_ordinal", None)
+        if ordinal is not None:
+            self._moving_annot_ordinal = None
+            if abs(dx) < 0.5 and abs(dy) < 0.5:
+                return
+            page = self.doc[self.current_page_index]
+            annots = list(page.annots())
+            if not (0 <= ordinal < len(annots)):
+                return
+            try:
+                old = fitz.Rect(annots[ordinal].rect)
+            except Exception:
+                return
+            self._push_undo()
+            # Re-fetch after the undo snapshot renumbers objects.
+            page = self.doc[self.current_page_index]
+            annots = list(page.annots())
+            if not (0 <= ordinal < len(annots)):
+                return
+            try:
+                annots[ordinal].set_rect(old + (dx, dy, dx, dy))
+                annots[ordinal].update()
+            except Exception as exc:
+                QMessageBox.warning(self, "Move Annotation", f"Could not move this annotation:\n{exc}")
+                return
+            self._selected_annot = (self.current_page_index, ordinal)
+            self._mark_dirty("Annotation moved", refresh_sidebars=True)
             return
 
         # Nothing tracked was under the cursor: do nothing (existing PDF body
         # text and images are intentionally not movable to avoid corruption).
         self._moving_text_hit = None
         self._moving_image_hit = None
+
+    def recolor_annotation_at(self, image_point: QPointF) -> bool:
+        """Recolour the annotation under the cursor (double-click, Move tool)."""
+        if self.doc is None:
+            return False
+        pdf_point = fitz.Point(image_point.x() / self.zoom, image_point.y() / self.zoom)
+        ordinal = self._find_annot_at_point(self.current_page_index, pdf_point)
+        if ordinal is None:
+            return False
+        page = self.doc[self.current_page_index]
+        annots = list(page.annots())
+        if not (0 <= ordinal < len(annots)):
+            return False
+        # Read the current colour BEFORE any undo snapshot (which renumbers and
+        # invalidates live annotation handles).
+        try:
+            colors = annots[ordinal].colors or {}
+            stroke = colors.get("stroke")
+            initial = QColor.fromRgbF(*stroke) if stroke else QColor("#000000")
+        except Exception:
+            initial = QColor("#000000")
+
+        color = QColorDialog.getColor(initial, self, "Annotation Colour")
+        if not color.isValid():
+            return True  # handled (user cancelled) — don't fall back to zoom
+
+        self._push_undo()
+        rgb = (color.redF(), color.greenF(), color.blueF())
+        # Re-fetch the annotation fresh after the undo snapshot.
+        page = self.doc[self.current_page_index]
+        annots = list(page.annots())
+        if not (0 <= ordinal < len(annots)):
+            return True
+        try:
+            annots[ordinal].set_colors(stroke=rgb)
+            annots[ordinal].update()
+        except Exception as exc:
+            QMessageBox.warning(self, "Recolour Annotation", f"Could not recolour:\n{exc}")
+            return True
+        self._selected_annot = (self.current_page_index, ordinal)
+        self._mark_dirty("Annotation recoloured", refresh_sidebars=True)
+        return True
+
+    def delete_selected_annot_on_canvas(self) -> bool:
+        """Delete the annotation selected on the canvas (Delete key, Move tool)."""
+        sel = getattr(self, "_selected_annot", None)
+        if self.doc is None or not sel:
+            return False
+        page_index, ordinal = sel
+        if page_index != self.current_page_index:
+            return False
+        page = self.doc[page_index]
+        annots = list(page.annots())
+        if not (0 <= ordinal < len(annots)):
+            self._selected_annot = None
+            return False
+        self._push_undo()
+        try:
+            page.delete_annot(annots[ordinal])
+        except Exception:
+            return False
+        try:
+            self.doc.reload_page(page)
+        except Exception:
+            pass
+        self._selected_annot = None
+        self._mark_dirty("Annotation deleted", refresh_sidebars=True)
+        return True
 
     def edit_existing_text_span(self, image_point: QPointF):
         page = self.doc[self.current_page_index]
@@ -3894,47 +4690,72 @@ class PdfStudioOverhaulPro(QMainWindow):
         self._mark_dirty("Signature added", refresh_sidebars=True)
 
     def _draw_signature(self, page, page_index, x, y, name, fontfile, size, color, kind="signature", align=0):
-        """Draw text (a signature or an added text box) as embedded text and
-        record it in the per-document registry, so it can later be moved from
-        clean source data rather than re-reading possibly-garbled subset text
-        from the PDF."""
+        """Draw an added item and record it in the per-document registry so it
+        can be moved later from clean source data.
+
+        Signatures are drawn as a transparent IMAGE (rendered once from the
+        script font). Re-embedding a subset script font on every move corrupts
+        its text encoding, so images are used instead — they move losslessly.
+        Text boxes stay as real Helvetica text (which does not corrupt).
+        """
         size = float(size)
+
+        if kind == "signature":
+            # Render the signature to a crisp transparent PNG and place it.
+            family = None
+            # Recover a family name for QFont from the font file, if given.
+            image = None
+            if fontfile:
+                fam = self._family_for_fontfile(fontfile)
+                image = render_signature_image(name, fam, color)
+            if image is None or image.isNull():
+                image = render_signature_image(name, APP_FONT_FAMILY, color)
+            png = self._qimage_to_png(image)
+            aspect = image.width() / max(image.height(), 1)
+            height = max(12.0, size)
+            width = height * aspect
+            max_w = page.rect.width * 0.95
+            if width > max_w:
+                width = max_w
+                height = width / max(aspect, 0.01)
+            rect = fitz.Rect(x, y, x + width, y + height)
+            page.insert_image(rect, stream=png, keep_proportion=False, overlay=True)
+            self.signatures.append({
+                "page": int(page_index),
+                "rect": [rect.x0, rect.y0, rect.x1, rect.y1],
+                "name": name,
+                "fontfile": fontfile,
+                "size": size,
+                "color": [color.red(), color.green(), color.blue()],
+                "kind": "signature",
+                "align": align,
+                "png": png,          # stored bytes → lossless re-placement
+                "img_w": image.width(),
+                "img_h": image.height(),
+            })
+            return
+
+        # --- text box: real Helvetica text (safe to redraw) ---
         self._font_alias_counter = getattr(self, "_font_alias_counter", 0) + 1
         fontname = "sig%d" % self._font_alias_counter
-
-        # Multi-line support (text boxes may contain newlines).
         lines = name.splitlines() or [name]
         try:
-            if fontfile:
-                text_len = max(fitz.get_text_length(ln, fontfile=fontfile, fontname=fontname, fontsize=size) for ln in lines)
-            else:
-                text_len = max(fitz.get_text_length(ln, fontname="helv", fontsize=size) for ln in lines)
+            text_len = max(fitz.get_text_length(ln, fontname="helv", fontsize=size) for ln in lines)
         except Exception:
             text_len = max(len(ln) for ln in lines) * size * 0.5
         n_lines = len(lines)
         box_w = min(max(text_len + size, size * 2), page.rect.width * 0.95)
         box_h = size * (1.4 * n_lines + 0.4)
         rect = fitz.Rect(x, y, x + box_w, y + box_h)
-
-        kwargs = dict(fontsize=size, color=rgb_from_qcolor(color), align=align, overlay=True)
-        if fontfile:
-            kwargs["fontname"] = fontname
-            kwargs["fontfile"] = fontfile
-        else:
-            kwargs["fontname"] = "helv"
-
-        rc = page.insert_textbox(rect, name, **kwargs)
+        rc = page.insert_textbox(rect, name, fontsize=size, fontname="helv",
+                                 color=rgb_from_qcolor(color), align=align, overlay=True)
         if rc < 0:
             rect = fitz.Rect(x, y, x + page.rect.width * 0.95, y + box_h * 1.5)
-            page.insert_textbox(rect, name, **kwargs)
-
-        # Record the placement with a rect generous enough to (a) match a later
-        # click and (b) fully cover the drawn glyphs — including script-font
-        # tails and descenders — when the item is erased for a move.
+            page.insert_textbox(rect, name, fontsize=size, fontname="helv",
+                                color=rgb_from_qcolor(color), align=align, overlay=True)
         pad_x = size * 0.4
         placed_rect = fitz.Rect(
-            x - pad_x * 0.25,
-            y - size * 0.2,
+            x - pad_x * 0.25, y - size * 0.2,
             x + min(text_len + pad_x, box_w) + pad_x,
             y + size * (1.4 * n_lines + 0.3),
         )
@@ -3942,12 +4763,29 @@ class PdfStudioOverhaulPro(QMainWindow):
             "page": int(page_index),
             "rect": [placed_rect.x0, placed_rect.y0, placed_rect.x1, placed_rect.y1],
             "name": name,
-            "fontfile": fontfile,
+            "fontfile": None,
             "size": size,
             "color": [color.red(), color.green(), color.blue()],
-            "kind": kind,
+            "kind": "textbox",
             "align": align,
         })
+
+    @staticmethod
+    def _qimage_to_png(image) -> bytes:
+        buf = QBuffer()
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        image.save(buf, "PNG")
+        data = bytes(buf.data())
+        buf.close()
+        return data
+
+    @staticmethod
+    def _family_for_fontfile(fontfile: str) -> str:
+        """Map a bundled signature font file back to its Qt family name."""
+        for fam, path in _SIGNATURE_FONT_PATHS.items():
+            if path == fontfile:
+                return fam
+        return APP_FONT_FAMILY
 
     def _find_signature_at_point(self, page_index: int, point: fitz.Point) -> Optional[int]:
         """Return the index in self.signatures of a placed signature under the
@@ -4004,6 +4842,215 @@ class PdfStudioOverhaulPro(QMainWindow):
                 align=1,
             )
         self._mark_dirty("Watermark added to all pages")
+
+    def compress_pdf(self):
+        """Save a size-reduced copy: garbage-collect, deflate streams, and
+        optionally downsample large images."""
+        if self.doc is None:
+            return
+        downsample = QMessageBox.question(
+            self, "Reduce File Size",
+            "Also downsample large images? (Smaller file, slightly lower image quality.)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes
+
+        default = "compressed.pdf"
+        if self.file_path:
+            src = Path(self.file_path)
+            default = str(src.with_name(f"{src.stem}_compressed.pdf"))
+        out, _ = QFileDialog.getSaveFileName(self, "Save Reduced PDF As", default, "PDF Files (*.pdf)")
+        if not out:
+            return
+        if not out.lower().endswith(".pdf"):
+            out += ".pdf"
+
+        try:
+            work = self.doc
+            temp = None
+            if downsample:
+                # Work on a copy so the open document is untouched.
+                temp = fitz.open("pdf", self.doc.tobytes())
+                self._downsample_images(temp)
+                work = temp
+
+            work.save(out, garbage=4, deflate=True, deflate_images=True,
+                      deflate_fonts=True, clean=True)
+            if temp is not None:
+                temp.close()
+
+            before = os.path.getsize(self.file_path) if self.file_path and os.path.exists(self.file_path) else None
+            after = os.path.getsize(out)
+            msg = f"Saved reduced PDF:\n{out}\n\nNew size: {self._human_size(after)}"
+            if before:
+                pct = (1 - after / before) * 100 if before else 0
+                msg += f"\nOriginal: {self._human_size(before)}  ({pct:.0f}% smaller)"
+            self.status.showMessage(f"Reduced PDF saved: {self._human_size(after)}")
+            QMessageBox.information(self, "Reduce File Size", msg)
+        except Exception as exc:
+            QMessageBox.critical(self, "Reduce File Size", f"Could not compress PDF:\n{exc}")
+
+    @staticmethod
+    def _human_size(n: int) -> str:
+        size = float(n)
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024 or unit == "GB":
+                return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+            size /= 1024
+        return f"{size:.1f} GB"
+
+    def _downsample_images(self, doc, max_dim: int = 1600, quality: int = 70):
+        """Re-encode oversized images as smaller JPEGs to cut file size."""
+        seen = set()
+        for page in doc:
+            for info in page.get_images(full=True):
+                xref = info[0]
+                if xref in seen:
+                    continue
+                seen.add(xref)
+                try:
+                    pix = fitz.Pixmap(doc, xref)
+                    if pix.width <= max_dim and pix.height <= max_dim:
+                        continue
+                    scale = max_dim / max(pix.width, pix.height)
+                    new_w = max(1, int(pix.width * scale))
+                    new_h = max(1, int(pix.height * scale))
+                    if pix.n > 4:  # CMYK etc → convert to RGB
+                        pix = fitz.Pixmap(fitz.csRGB, pix)
+                    pix = fitz.Pixmap(pix, new_w, new_h)  # scale
+                    img_bytes = pix.tobytes("jpeg", jpg_quality=quality)
+                    doc.update_stream(xref, img_bytes)  # best-effort
+                except Exception:
+                    continue
+
+    # ---- Header / footer & page numbering ---------------------------------
+    def add_header_footer(self):
+        if self.doc is None:
+            return
+        dialog = HeaderFooterDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        cfg = dialog.values()
+        if not any(cfg["slots"].values()):
+            return
+
+        from datetime import datetime
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        total = self.doc.page_count
+        margin = float(cfg["margin"])
+        size = float(cfg["size"])
+        color = QColor(cfg["color"])
+
+        def expand(txt, page_no):
+            return (txt.replace("{page}", str(page_no))
+                       .replace("{pages}", str(total))
+                       .replace("{date}", date_str))
+
+        self._push_undo()
+        for i in range(total):
+            page = self.doc[i]
+            r = page.rect
+            y_top = margin
+            y_bot = r.height - margin - size
+            positions = {
+                "hl": (r.x0 + margin, y_top, 0),
+                "hc": (r.x0, y_top, 1),
+                "hr": (r.x0, y_top, 2),
+                "fl": (r.x0 + margin, y_bot, 0),
+                "fc": (r.x0, y_bot, 1),
+                "fr": (r.x0, y_bot, 2),
+            }
+            for key, text in cfg["slots"].items():
+                if not text:
+                    continue
+                x, y, align = positions[key]
+                content = expand(text, i + 1)
+                box = fitz.Rect(margin, y, r.width - margin, y + size * 1.6)
+                self._safe_insert_textbox(page, box, content, fontsize=size,
+                                          color=color, align=align)
+        self._mark_dirty("Header/footer added to all pages", refresh_sidebars=True)
+
+    def add_bates_numbering(self):
+        if self.doc is None:
+            return
+        prefix, ok = QInputDialog.getText(self, "Bates Numbering", "Prefix (optional):", text="")
+        if not ok:
+            return
+        start, ok = QInputDialog.getInt(self, "Bates Numbering", "Start number:", 1, 0, 10_000_000)
+        if not ok:
+            return
+        digits, ok = QInputDialog.getInt(self, "Bates Numbering", "Zero-padded digits:", 6, 1, 12)
+        if not ok:
+            return
+
+        self._push_undo()
+        size = 9.0
+        for i in range(self.doc.page_count):
+            page = self.doc[i]
+            r = page.rect
+            label = f"{prefix}{str(start + i).zfill(digits)}"
+            box = fitz.Rect(r.width - 220, r.height - 26, r.width - 12, r.height - 8)
+            self._safe_insert_textbox(page, box, label, fontsize=size,
+                                      color=QColor(40, 40, 40), align=2)
+        self._mark_dirty("Bates numbering applied", refresh_sidebars=True)
+
+    # ---- Interactive form fields (AcroForm) -------------------------------
+    def fill_form_fields(self):
+        if self.doc is None:
+            return
+        if not getattr(self.doc, "is_form_pdf", False):
+            QMessageBox.information(self, "Fill Form Fields",
+                                    "This PDF has no interactive form fields.")
+            return
+
+        type_map = {
+            fitz.PDF_WIDGET_TYPE_TEXT: "text",
+            fitz.PDF_WIDGET_TYPE_CHECKBOX: "checkbox",
+            fitz.PDF_WIDGET_TYPE_COMBOBOX: "combobox",
+            fitz.PDF_WIDGET_TYPE_LISTBOX: "listbox",
+            fitz.PDF_WIDGET_TYPE_RADIOBUTTON: "radio",
+        }
+        fields: List[Dict] = []
+        for pi in range(self.doc.page_count):
+            page = self.doc[pi]
+            for wi, wdg in enumerate(page.widgets()):
+                fields.append({
+                    "page": pi,
+                    "index": wi,
+                    "name": wdg.field_name or "",
+                    "type": type_map.get(wdg.field_type, "text"),
+                    "value": wdg.field_value,
+                    "choices": list(getattr(wdg, "choice_values", None) or []),
+                })
+        if not fields:
+            QMessageBox.information(self, "Fill Form Fields",
+                                    "This PDF has no fillable fields.")
+            return
+
+        dialog = FormFillDialog(self, fields)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        results = dialog.result_values()
+
+        self._push_undo()
+        changed = 0
+        # Re-fetch widgets by page + index so we write to live objects.
+        for pi in range(self.doc.page_count):
+            page = self.doc[pi]
+            widgets = list(page.widgets())
+            for r in results:
+                if r["page"] != pi or not (0 <= r["index"] < len(widgets)):
+                    continue
+                wdg = widgets[r["index"]]
+                try:
+                    if r["type"] == "checkbox":
+                        wdg.field_value = bool(r["new_value"])
+                    else:
+                        wdg.field_value = str(r["new_value"])
+                    wdg.update()
+                    changed += 1
+                except Exception:
+                    continue
+        self._mark_dirty(f"Form fields updated ({changed})", refresh_sidebars=True)
 
     def rotate_current_page_clockwise(self):
         self._rotate_current_page(90)
@@ -4064,10 +5111,38 @@ class PdfStudioOverhaulPro(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Duplicate Page Error", f"Could not duplicate page:\n{exc}")
 
+    def _on_pages_reordered(self, parent, start, end, dest_parent, dest_row):
+        """React to a drag-reorder in the Pages thumbnail list by reordering the
+        document to match, using an explicit page-order list (robust)."""
+        if self.doc is None or getattr(self, "_suppress_page_reorder", False):
+            return
+        n = self.doc.page_count
+        src = int(start)
+        dst = int(dest_row)
+        # Qt's destination is the insert row in the pre-removal list; when moving
+        # downward the effective target shifts left by one after removal.
+        if dst > src:
+            dst -= 1
+        if not (0 <= src < n):
+            return
+        dst = max(0, min(dst, n - 1))
+        if src == dst:
+            return
+        order = list(range(n))
+        order.insert(dst, order.pop(src))
+        try:
+            self._push_undo()
+            self.doc.select(order)
+            self.current_page_index = dst
+            self._mark_page_structure_changed()
+            self._mark_dirty(f"Page {src + 1} moved to position {dst + 1}", refresh_sidebars=True)
+        except Exception as exc:
+            QMessageBox.warning(self, "Reorder Pages", f"Could not reorder pages:\n{exc}")
+            self.refresh_page_thumbnails()
+
     def move_page_up(self):
         if self.doc is None or self.current_page_index <= 0:
             return
-        self._push_undo()
         self.doc.move_page(self.current_page_index, self.current_page_index - 1)
         self.current_page_index -= 1
         self._mark_page_structure_changed()
@@ -4114,6 +5189,28 @@ class PdfStudioOverhaulPro(QMainWindow):
             self._mark_dirty("PDF merged", refresh_sidebars=True)
         except Exception as exc:
             QMessageBox.critical(self, "Merge Error", f"Could not merge PDF:\n{exc}")
+
+    def insert_pdf_at(self, before: bool = False):
+        """Insert another PDF's pages before/after the current page."""
+        if self.doc is None:
+            return
+        where = "Before" if before else "After"
+        path, _ = QFileDialog.getOpenFileName(self, f"Insert PDF {where} Current Page", "", "PDF Files (*.pdf)")
+        if not path:
+            return
+        try:
+            src = fitz.open(path)
+            if src.page_count == 0:
+                raise ValueError("Selected PDF has no pages.")
+            start_at = self.current_page_index if before else self.current_page_index + 1
+            self._push_undo()
+            self.doc.insert_pdf(src, start_at=start_at)
+            src.close()
+            self.current_page_index = start_at
+            self._mark_page_structure_changed()
+            self._mark_dirty(f"Inserted {where.lower()} page {self.current_page_index}", refresh_sidebars=True)
+        except Exception as exc:
+            QMessageBox.critical(self, "Insert Error", f"Could not insert PDF:\n{exc}")
 
     def extract_page_range(self):
         if self.doc is None:
@@ -4674,6 +5771,91 @@ def signature_font_file(family: str) -> Optional[str]:
     return None
 
 
+# ---- Spell checking --------------------------------------------------------
+_SPELL_CHECKER = None          # a callable(word)->bool ("is this word known?")
+_SPELL_READY = False
+_WORD_RE = re.compile(r"[A-Za-z][A-Za-z'’]*")
+
+
+def _load_spell_checker():
+    """Lazily build a spell checker. Prefers the `pyspellchecker` package
+    (offline dictionary); falls back to a system word list; if neither is
+    available, spell checking is disabled gracefully."""
+    global _SPELL_CHECKER, _SPELL_READY
+    if _SPELL_READY:
+        return _SPELL_CHECKER
+    _SPELL_READY = True
+
+    # 1. pyspellchecker (bundled dictionary, best quality)
+    try:
+        from spellchecker import SpellChecker
+        sc = SpellChecker(distance=1)
+
+        def _known(word: str) -> bool:
+            return len(sc.unknown([word])) == 0
+
+        _SPELL_CHECKER = _known
+        return _SPELL_CHECKER
+    except Exception:
+        pass
+
+    # 2. System word list fallback.
+    for path in ("/usr/share/dict/words", "/usr/share/dict/american-english",
+                 "/usr/dict/words"):
+        try:
+            if os.path.exists(path):
+                with open(path, "r", errors="ignore") as fh:
+                    words = {w.strip().lower() for w in fh if w.strip()}
+                if words:
+                    def _known(word: str, _words=words) -> bool:
+                        return word.lower() in _words
+                    _SPELL_CHECKER = _known
+                    return _SPELL_CHECKER
+        except Exception:
+            continue
+
+    _SPELL_CHECKER = None
+    return None
+
+
+def spell_checker_available() -> bool:
+    return _load_spell_checker() is not None
+
+
+# ---- Cryptographic digital signatures (pyHanko) ---------------------------
+def pyhanko_available() -> bool:
+    try:
+        import pyhanko  # noqa: F401
+        from pyhanko.sign import signers  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def is_word_misspelled(word: str) -> bool:
+    """True if the token looks like an ordinary word that the dictionary does
+    not recognise. Tokens with digits, all-caps acronyms, single letters, or
+    mixed-case (e.g. camelCase / product names) are skipped to avoid noise."""
+    checker = _load_spell_checker()
+    if checker is None:
+        return False
+    core = word.strip("'’")
+    if len(core) < 3:
+        return False
+    if any(ch.isdigit() for ch in core):
+        return False
+    # Skip acronyms / all-caps and odd mixed-caps tokens.
+    if core.isupper():
+        return False
+    letters = core.replace("'", "").replace("’", "")
+    if not letters.isalpha():
+        return False
+    try:
+        return not checker(core.lower())
+    except Exception:
+        return False
+
+
 def font_file_for_pdf_font(pdf_font_name: str) -> Optional[str]:
     """Match a font name found inside a PDF (e.g. 'GreatVibes-Regular', possibly
     with a subset prefix like 'ABCDEF+GreatVibes-Regular') back to a bundled
@@ -4856,3 +6038,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
