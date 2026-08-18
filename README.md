@@ -10,6 +10,7 @@ Suketchi PDF delivers a smooth, native desktop experience for viewing, navigatin
 
 <img width="2165" height="1393" alt="Screenshot_20260817_221032-1" src="https://github.com/user-attachments/assets/d9315c51-d618-4fad-98be-08df1bb9670b" />
 <img width="2163" height="1398" alt="2" src="https://github.com/user-attachments/assets/e070ba20-67fb-4e44-9a1f-d8a5c760a0a9" />
+<img width="2370" height="1596" alt="Screenshot_20260817_221817" src="https://github.com/user-attachments/assets/553611dd-da63-40dd-b8f9-98f17db8f412" />
 
 ---
 
