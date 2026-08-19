@@ -3908,15 +3908,21 @@ class PdfStudioOverhaulPro(QMainWindow):
                 # hidden copies. (We always re-insert, so removal is safe.)
                 new_rect = old_rect + (dx, dy, dx, dy)
                 try:
-                    page.add_redact_annot(old_rect + (-2, -2, 2, 2), fill=(1, 1, 1))
-                    page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_REMOVE)
+                    # No fill: a filled redaction paints a solid box over the
+                    # whole rectangle, which would blank out any background
+                    # page content the signature happened to be dragged over.
+                    # We only want the old signature image gone, so leave
+                    # text/graphics untouched and don't paint anything.
+                    page.add_redact_annot(old_rect + (-2, -2, 2, 2))
+                    page.apply_redactions(
+                        images=fitz.PDF_REDACT_IMAGE_REMOVE,
+                        text=fitz.PDF_REDACT_TEXT_NONE,
+                        graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+                    )
                     self.doc.reload_page(page)
                     page = self.doc[self.current_page_index]
                 except Exception:
-                    try:
-                        page.draw_rect(old_rect + (-2, -2, 2, 2), color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
-                    except Exception:
-                        pass
+                    pass
                 page.insert_image(new_rect, stream=sig["png"],
                                   keep_proportion=False, overlay=True)
                 sig = dict(sig)
