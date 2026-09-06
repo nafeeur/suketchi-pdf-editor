@@ -19,14 +19,8 @@ Suketchi PDF delivers a smooth, native desktop experience for viewing, navigatin
 ### Prerequisites
 * Python 3.10 or higher installed on your computer.
 
-### 1. Clone the Repository
-```bash
-git clone https://github.com/nafeeur/suketchi-pdf-editor
-cd suketchi-pdf-editor
-```
-
-### 2. Set Up a Virtual Environment
-It is highly recommended to isolate your project dependencies using a virtual environment:
+### Install from PyPI
+It is highly recommended to isolate the install using a virtual environment:
 
 * **Linux / macOS**:
   ```bash
@@ -39,18 +33,30 @@ It is highly recommended to isolate your project dependencies using a virtual en
   venv\Scripts\activate
   ```
 
-### 3. Install Required Dependencies
-Upgrade pip and install the core GUI and rendering engine packages:
+Then install with pip:
 ```bash
 pip install --upgrade pip
-pip install PyQt6 PyMuPDF
+pip install suketchi
+```
+
+Optional extras add support for spell checking, DOCX export, and cryptographic PDF signing:
+```bash
+pip install "suketchi[all]"
 ```
 
 ## Running the Application
 
-Once your virtual environment is active and dependencies are fully installed, launch the editor:
+Once installed, launch the editor with:
 ```bash
-python suketchi_pdf.py
+suketchi
+```
+
+### Running from source
+```bash
+git clone https://github.com/nafeeur/suketchi-pdf-editor
+cd suketchi-pdf-editor
+pip install -e .
+suketchi
 ```
 
 ---
