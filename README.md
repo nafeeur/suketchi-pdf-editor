@@ -1,4 +1,4 @@
-![PDF Editor Banner](https://github.com/user-attachments/assets/5a1e1c6c-ddd3-420a-905c-af647978de5d)
+![PDF Editor Banner](https://raw.githubusercontent.com/nafeeur/suketchi-pdf-editor/main/docs/screenshots/banner.jpg)
 
 ## A lightweight, free, and open-source PDF reader and editor.
 
@@ -8,9 +8,11 @@ Suketchi PDF delivers a smooth, native desktop experience for viewing, navigatin
 
 ## Screenshots
 
-<img width="2165" height="1393" alt="Screenshot_20260817_221032-1" src="https://github.com/user-attachments/assets/d9315c51-d618-4fad-98be-08df1bb9670b" />
-<img width="2163" height="1398" alt="2" src="https://github.com/user-attachments/assets/e070ba20-67fb-4e44-9a1f-d8a5c760a0a9" />
-<img width="2370" height="1596" alt="Screenshot_20260817_221817" src="https://github.com/user-attachments/assets/553611dd-da63-40dd-b8f9-98f17db8f412" />
+![Editing a PDF in Suketchi](https://raw.githubusercontent.com/nafeeur/suketchi-pdf-editor/main/docs/screenshots/screenshot1.jpg)
+
+![Suketchi tools panel](https://raw.githubusercontent.com/nafeeur/suketchi-pdf-editor/main/docs/screenshots/screenshot2.jpg)
+
+![Suketchi page view](https://raw.githubusercontent.com/nafeeur/suketchi-pdf-editor/main/docs/screenshots/screenshot3.jpg)
 
 ---
 
