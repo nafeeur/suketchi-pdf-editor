@@ -51,6 +51,15 @@ Once installed, launch the editor with:
 suketchi
 ```
 
+The first time you run it, Suketchi automatically adds itself to your applications
+menu (Linux), Start Menu (Windows), or Applications folder (macOS) with its icon,
+so afterwards you can just launch it like any other installed app. (pip cannot run
+this step during `pip install` itself — it happens on first launch instead.) To
+add or refresh the shortcut manually, run:
+```bash
+suketchi --install-shortcut
+```
+
 ### Running from source
 ```bash
 git clone https://github.com/nafeeur/suketchi-pdf-editor

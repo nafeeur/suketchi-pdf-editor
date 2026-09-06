@@ -6022,6 +6022,17 @@ _apply_light_palette = _apply_bw_palette
 
 
 def main():
+    if "--install-shortcut" in sys.argv:
+        from .desktop import install_shortcut
+        install_shortcut(force=True)
+        return
+
+    try:
+        from .desktop import install_shortcut
+        install_shortcut()
+    except Exception:
+        pass
+
     # High-DPI adaptation must be configured before the QApplication exists.
     # PassThrough keeps fractional scaling exact so the UI stays crisp on any
     # display resolution / scale factor (100%, 125%, 150%, 200%, ...).

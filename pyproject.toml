@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "suketchi"
-version = "0.1.0"
+version = "0.1.1"
 description = "A lightweight, free, and open-source PDF reader and editor."
 readme = "README.md"
 license = "GPL-3.0-or-later"
@@ -30,6 +30,7 @@ classifiers = [
 dependencies = [
     "PyQt6>=6.4",
     "PyMuPDF>=1.23",
+    "pyshortcuts>=1.9",
 ]
 
 [project.optional-dependencies]
