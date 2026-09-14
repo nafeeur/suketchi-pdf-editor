@@ -4942,7 +4942,14 @@ class PdfStudioOverhaulPro(QMainWindow):
                         pix = fitz.Pixmap(fitz.csRGB, pix)
                     pix = fitz.Pixmap(pix, new_w, new_h)  # scale
                     img_bytes = pix.tobytes("jpeg", jpg_quality=quality)
-                    doc.update_stream(xref, img_bytes)  # best-effort
+                    # Use replace_image (not update_stream) so the image
+                    # object's /Width and /Height are updated to match the
+                    # smaller JPEG. update_stream only swaps the raw bytes,
+                    # leaving the old dimensions in place, which produces a
+                    # PDF that violates the spec (flagged by Ghostscript as
+                    # a "recoverable image error") and can fail to render in
+                    # stricter viewers.
+                    page.replace_image(xref, stream=img_bytes)
                 except Exception:
                     continue
 
@@ -5167,6 +5174,7 @@ class PdfStudioOverhaulPro(QMainWindow):
     def move_page_up(self):
         if self.doc is None or self.current_page_index <= 0:
             return
+        self._push_undo()
         self.doc.move_page(self.current_page_index, self.current_page_index - 1)
         self.current_page_index -= 1
         self._mark_page_structure_changed()
