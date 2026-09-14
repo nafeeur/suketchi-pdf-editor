@@ -1108,7 +1108,11 @@ class FormFillDialog(QDialog):
             label = f["name"] or f"(field on p.{f['page']+1})"
             if ftype == "checkbox":
                 editor = QCheckBox()
-                editor.setChecked(str(f["value"]).lower() not in ("off", "", "false", "no", "0"))
+                value = f["value"]
+                editor.setChecked(
+                    value is not None
+                    and str(value).lower() not in ("off", "", "false", "no", "0")
+                )
             elif ftype in ("combobox", "listbox") and f.get("choices"):
                 editor = QComboBox()
                 editor.setEditable(ftype == "combobox")
@@ -1731,8 +1735,8 @@ class DocumentTab:
         self.is_dirty = False
         self.search_results: List[Tuple[int, "fitz.Rect"]] = []
         self.search_index = -1
-        self.undo_stack: List[bytes] = []
-        self.redo_stack: List[bytes] = []
+        self.undo_stack: List[Tuple[bytes, List[Dict]]] = []
+        self.redo_stack: List[Tuple[bytes, List[Dict]]] = []
         self.doc_version = 0
         self.render_cache: Dict[Tuple[int, float, int], QPixmap] = {}
         self.render_cache_order: List[Tuple[int, float, int]] = []
@@ -1930,8 +1934,8 @@ class PdfStudioOverhaulPro(QMainWindow):
         self.pending_signature: Optional[Dict] = None
         self._selected_annot: Optional[Tuple[int, int]] = None
         self.signatures: List[Dict] = []
-        self.undo_stack: List[bytes] = []
-        self.redo_stack: List[bytes] = []
+        self.undo_stack: List[Tuple[bytes, List[Dict]]] = []
+        self.redo_stack: List[Tuple[bytes, List[Dict]]] = []
         self.max_history = 10
         self._pdf_password = ""
         self._workers: List[Tuple[QThread, QObject]] = []
@@ -2807,6 +2811,7 @@ class PdfStudioOverhaulPro(QMainWindow):
                     return
 
             if doc.page_count == 0:
+                doc.close()
                 raise ValueError("The selected PDF has no pages.")
 
             # Snapshot the currently active tab before switching context.
@@ -2870,6 +2875,11 @@ class PdfStudioOverhaulPro(QMainWindow):
         # Spell-check rects are per (doc-version, page, zoom); clear on switch so
         # a different document never reuses another's cached rects.
         self._spell_cache = {}
+        # A canvas-selected annotation is a (page_index, ordinal) pair that
+        # only makes sense against the tab it was selected in; carrying it
+        # over could make Delete remove the wrong annotation in another tab
+        # whose current page happens to share the same index.
+        self._selected_annot = None
 
         self.search_results_list.clear()
         self._set_document_controls(True)
@@ -3608,7 +3618,7 @@ class PdfStudioOverhaulPro(QMainWindow):
             return
         page_index = item.data(Qt.ItemDataRole.UserRole)
         if isinstance(page_index, int):
-            self.current_page_index = page_index
+            self.current_page_index = clamp(page_index, 0, self.doc.page_count - 1)
             self.render_current_page()
 
     def delete_selected_annotation(self):
@@ -3639,6 +3649,12 @@ class PdfStudioOverhaulPro(QMainWindow):
         if removed:
             self._mark_dirty("Annotation deleted", refresh_sidebars=True)
         else:
+            # Nothing actually changed (stale ordinal): drop the undo entry
+            # _push_undo() just created so Undo/Redo history isn't polluted
+            # with a no-op snapshot.
+            if self.undo_stack:
+                self.undo_stack.pop()
+                self._refresh_history_actions()
             QMessageBox.information(self, "Delete Annotation", "That annotation could not be found (it may have already been removed).")
 
     def delete_all_annotations(self):
@@ -4178,13 +4194,18 @@ class PdfStudioOverhaulPro(QMainWindow):
             return
 
         self._push_undo()
+        idx = self.current_page_index
+        pages_before = self.doc.page_count
         self._insert_reflowed_text_pages(
             text=text,
-            start_at=self.current_page_index + 1,
+            start_at=idx + 1,
             page_size=(page.rect.width, page.rect.height),
-            title=f"Reflowed copy of page {self.current_page_index + 1}",
+            title=f"Reflowed copy of page {idx + 1}",
         )
+        inserted = self.doc.page_count - pages_before
+        self._remap_signature_pages(lambda p: p + inserted if p > idx else p)
         self.current_page_index += 1
+        self._mark_page_structure_changed()
         self._mark_dirty("Reflowed page inserted after current page", refresh_sidebars=True)
 
     def reflow_document_to_new_pdf(self):
@@ -4824,6 +4845,23 @@ class PdfStudioOverhaulPro(QMainWindow):
                 best = i  # later placements are on top
         return best
 
+    def _remap_signature_pages(self, mapper):
+        """Update self.signatures' "page" index after a page-structure change
+        (delete/duplicate/move/insert/reorder), using `mapper(old_page_index)
+        -> new_page_index | None`. A tracked entry whose page vanished (e.g.
+        the page it was on got deleted) is dropped rather than left pointing
+        at the wrong page — a stale entry there could make the Move tool
+        redact/erase real content on a page the signature was never on."""
+        kept = []
+        for sig in self.signatures:
+            new_page = mapper(sig.get("page"))
+            if new_page is None:
+                continue
+            sig = dict(sig)
+            sig["page"] = new_page
+            kept.append(sig)
+        self.signatures = kept
+
     def add_stamp(self):
         presets = ["DRAFT", "APPROVED", "CONFIDENTIAL", "REVIEWED", "PAID", "VOID", "FINAL"]
         text, ok = QInputDialog.getItem(self, "Add Stamp", "Stamp:", presets, 0, True)
@@ -5109,7 +5147,9 @@ class PdfStudioOverhaulPro(QMainWindow):
         if response != QMessageBox.StandardButton.Yes:
             return
         self._push_undo()
+        deleted = self.current_page_index
         self.doc.delete_page(self.current_page_index)
+        self._remap_signature_pages(lambda p: None if p == deleted else (p - 1 if p > deleted else p))
         self.current_page_index = min(self.current_page_index, self.doc.page_count - 1)
         self._mark_page_structure_changed()
         self._mark_dirty("Page deleted", refresh_sidebars=True)
@@ -5136,6 +5176,8 @@ class PdfStudioOverhaulPro(QMainWindow):
             )
             temp_doc.close()
 
+            original = self.current_page_index
+            self._remap_signature_pages(lambda p: p + 1 if p > original else p)
             self.current_page_index += 1
             self._mark_page_structure_changed()
             self._mark_dirty("Page duplicated", refresh_sidebars=True)
@@ -5164,6 +5206,8 @@ class PdfStudioOverhaulPro(QMainWindow):
         try:
             self._push_undo()
             self.doc.select(order)
+            inverse = {old: new for new, old in enumerate(order)}
+            self._remap_signature_pages(lambda p: inverse.get(p))
             self.current_page_index = dst
             self._mark_page_structure_changed()
             self._mark_dirty(f"Page {src + 1} moved to position {dst + 1}", refresh_sidebars=True)
@@ -5175,7 +5219,9 @@ class PdfStudioOverhaulPro(QMainWindow):
         if self.doc is None or self.current_page_index <= 0:
             return
         self._push_undo()
-        self.doc.move_page(self.current_page_index, self.current_page_index - 1)
+        idx = self.current_page_index
+        self.doc.move_page(idx, idx - 1)
+        self._remap_signature_pages(lambda p: idx - 1 if p == idx else (idx if p == idx - 1 else p))
         self.current_page_index -= 1
         self._mark_page_structure_changed()
         self._mark_dirty("Page moved up", refresh_sidebars=True)
@@ -5184,12 +5230,17 @@ class PdfStudioOverhaulPro(QMainWindow):
         if self.doc is None or self.current_page_index >= self.doc.page_count - 1:
             return
         self._push_undo()
-        # no-op because the page is already right before index+1.
-        target = self.current_page_index + 2
+        idx = self.current_page_index
+        # move_page(pno, to) inserts before the page currently numbered `to`;
+        # moving to idx+1 would be a no-op (the page is already right before
+        # it), so the target is bumped by one more to land after it instead.
+        target = idx + 2
         if target >= self.doc.page_count:
-            self.doc.move_page(self.current_page_index, -1)
+            self.doc.move_page(idx, -1)
         else:
-            self.doc.move_page(self.current_page_index, target)
+            self.doc.move_page(idx, target)
+        # Net effect either way is a straight swap of idx and idx+1.
+        self._remap_signature_pages(lambda p: idx + 1 if p == idx else (idx if p == idx + 1 else p))
         self.current_page_index += 1
         self._mark_page_structure_changed()
         self._mark_dirty("Page moved down", refresh_sidebars=True)
@@ -5199,7 +5250,9 @@ class PdfStudioOverhaulPro(QMainWindow):
             return
         self._push_undo()
         current = self.doc[self.current_page_index]
-        self.doc.new_page(pno=self.current_page_index + 1, width=current.rect.width, height=current.rect.height)
+        idx = self.current_page_index
+        self.doc.new_page(pno=idx + 1, width=current.rect.width, height=current.rect.height)
+        self._remap_signature_pages(lambda p: p + 1 if p > idx else p)
         self.current_page_index += 1
         self._mark_page_structure_changed()
         self._mark_dirty("Blank page inserted", refresh_sidebars=True)
@@ -5214,9 +5267,12 @@ class PdfStudioOverhaulPro(QMainWindow):
             src = fitz.open(path)
             if src.page_count == 0:
                 raise ValueError("Selected PDF has no pages.")
+            count = src.page_count
+            idx = self.current_page_index
             self._push_undo()
-            self.doc.insert_pdf(src, start_at=self.current_page_index + 1)
+            self.doc.insert_pdf(src, start_at=idx + 1)
             src.close()
+            self._remap_signature_pages(lambda p: p + count if p > idx else p)
             self._mark_page_structure_changed()
             self._mark_dirty("PDF merged", refresh_sidebars=True)
         except Exception as exc:
@@ -5234,10 +5290,12 @@ class PdfStudioOverhaulPro(QMainWindow):
             src = fitz.open(path)
             if src.page_count == 0:
                 raise ValueError("Selected PDF has no pages.")
+            count = src.page_count
             start_at = self.current_page_index if before else self.current_page_index + 1
             self._push_undo()
             self.doc.insert_pdf(src, start_at=start_at)
             src.close()
+            self._remap_signature_pages(lambda p: p + count if p >= start_at else p)
             self.current_page_index = start_at
             self._mark_page_structure_changed()
             self._mark_dirty(f"Inserted {where.lower()} page {self.current_page_index}", refresh_sidebars=True)
@@ -5538,11 +5596,17 @@ class PdfStudioOverhaulPro(QMainWindow):
         self.zoom_combo.setCurrentText(text)
         self.zoom_combo.blockSignals(False)
 
+    def _snapshot_signatures(self) -> List[Dict]:
+        """Shallow-copy the signature registry so a later in-place edit (e.g.
+        end_move_text's `sig = dict(sig)` replace) never mutates a snapshot
+        already pushed onto the undo/redo stacks."""
+        return [dict(s) for s in self.signatures]
+
     def _push_undo(self):
         if self.doc is None:
             return
         try:
-            self.undo_stack.append(self.doc.tobytes(garbage=4, deflate=True))
+            self.undo_stack.append((self.doc.tobytes(garbage=4, deflate=True), self._snapshot_signatures()))
             if len(self.undo_stack) > self.max_history:
                 self.undo_stack.pop(0)
             self.redo_stack.clear()
@@ -5554,10 +5618,11 @@ class PdfStudioOverhaulPro(QMainWindow):
         if self.doc is None or not self.undo_stack:
             return
         try:
-            self.redo_stack.append(self.doc.tobytes(garbage=4, deflate=True))
-            data = self.undo_stack.pop()
+            self.redo_stack.append((self.doc.tobytes(garbage=4, deflate=True), self._snapshot_signatures()))
+            data, signatures = self.undo_stack.pop()
             self.doc.close()
             self.doc = fitz.open(stream=data, filetype="pdf")
+            self.signatures = signatures
             self._doc_version += 1
             self._render_cache.clear()
             self._render_cache_order.clear()
@@ -5574,10 +5639,11 @@ class PdfStudioOverhaulPro(QMainWindow):
         if self.doc is None or not self.redo_stack:
             return
         try:
-            self.undo_stack.append(self.doc.tobytes(garbage=4, deflate=True))
-            data = self.redo_stack.pop()
+            self.undo_stack.append((self.doc.tobytes(garbage=4, deflate=True), self._snapshot_signatures()))
+            data, signatures = self.redo_stack.pop()
             self.doc.close()
             self.doc = fitz.open(stream=data, filetype="pdf")
+            self.signatures = signatures
             self._doc_version += 1
             self._render_cache.clear()
             self._render_cache_order.clear()
@@ -5876,8 +5942,13 @@ def is_word_misspelled(word: str) -> bool:
         return False
     if any(ch.isdigit() for ch in core):
         return False
-    # Skip acronyms / all-caps and odd mixed-caps tokens.
+    # Skip acronyms / all-caps tokens.
     if core.isupper():
+        return False
+    # Skip camelCase / internal-capital tokens (e.g. "iPhone", "McDonald") —
+    # an uppercase letter after the first character usually marks a product
+    # name or proper noun, not a typo.
+    if any(ch.isupper() for ch in core[1:]):
         return False
     letters = core.replace("'", "").replace("’", "")
     if not letters.isalpha():
